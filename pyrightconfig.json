@@ -1,0 +1,36 @@
+{
+  "include": ["."],
+  "exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/modules/utils/pyside_stub.py",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    "**/*.pyi"
+  ],
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "warning",
+  "reportMissingModuleSource": "none",
+  "reportAttributeAccessIssue": "warning",
+  "reportGeneralTypeIssues": "warning",
+  "venvPath": ".", 
+  "venv": ".venv", 
+  "extraPaths": [
+    ".",
+    "modules",
+    "modules/gui/mixins"
+  ],
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": [
+        ".",
+        "modules",
+        "modules/gui/mixins"
+      ]
+    }
+  ]
+}

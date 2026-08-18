@@ -1,0 +1,53 @@
+name: Build WebAssembly Engine
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-wasm:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+
+      - name: Build WebAssembly Module
+        run: |
+          mkdir -p build/wasm
+          cp include/world/*.h src/world/
+          # Compile WORLD vocoder and vose_core with Emscripten
+          # Use em++ for C++ linking and add -sDEFAULT_TO_CXX to resolve C++ runtime symbols
+          em++ src/vose_core.cpp \
+               src/world/audioio.cpp \
+               src/world/cheaptrick.cpp \
+               src/world/common.cpp \
+               src/world/d4c.cpp \
+               src/world/dio.cpp \
+               src/world/fft.cpp \
+               src/world/harvest.cpp \
+               src/world/matlabfunctions.cpp \
+               src/world/stonemask.cpp \
+               src/world/synthesis.cpp \
+               -Iinclude \
+               -O3 \
+               -s WASM=1 \
+               -s ALLOW_MEMORY_GROWTH=1 \
+               -s EXPORTED_FUNCTIONS="['_load_embedded_resource', '_execute_render', '_set_vocal_timeline', '_get_engine_version', '_clear_engine_cache', '_malloc', '_free']" \
+               -s EXPORTED_RUNTIME_METHODS="['ccall', 'cwrap', 'getValue', 'setValue']" \
+               -s DEFAULT_TO_CXX \
+               -o build/wasm/vose_core.js
+
+      - name: Upload WebAssembly Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vose-wasm-engine
+          path: build/wasm/

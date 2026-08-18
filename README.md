@@ -1,11 +1,31 @@
-<div align="center">
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+VO-SE Pro は、Python による高度な日本語言語解析と、C言語による高速な信号処理を組み合わせた、次世代ハイブリッド型音声合成プラットフォームです。
 
-  <h1>Built with AI Studio</h2>
+🚀 3つのコア・テクノロジー
+1. ハイブリッド・パフォーマンス
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+ロジック制御と複雑な解析には柔軟な Python を、レイテンシが命となる音声信号処理には C言語 (C++20) を採用。 DLL/dylib 連携により、業界トップクラスの「動作の軽快さ」と「データ軽量化」を両立しました。
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+2. Aural AI & Dynamics Engine
 
-</div>
+上位互換エンジン Aural AI を搭載。 フルコンテキストラベル（アクセント・音素情報）を解析し、AIによる自然なピッチダイナミクスを生成します。
+
+3. クロスプラットフォーム・デリバリー
+
+GitHub Actions による CI/CD パイプラインを構築。 Windows (.exe) だけでなく、macOS (.app) 環境にも対応。アドホック署名を自動適用し、最新の Apple Silicon Mac でも動作可能なバイナリを提供します。
+
+
+
+📢 開発の実情とパートナー募集
+現在、VO-SE Pro は 「aural技術チーム（開発者1名(笑、友達いないんだなこいつ）」 で開発しています
+
+【Macユーザーの方へ】 開発者が中学生のため、Apple Developer登録料（年間99ドル）の捻出が難しく、現在は「未認証（アドホック署名）」での配布となっています。初回起動時に警告が出ますが、ご了承お願いします。
+
+このソフトはまだ目標である「公式音源」がまだないのでその音源提供者を探しています。VO-SE Proの進化を共に。
+
+📦 インストール
+[release] から、OSに合ったファイルをダウンロード。
+
+Windows: .exe を実行。
+
+Mac: .zip を解凍し、アプリを 右クリック > 開く で実行。

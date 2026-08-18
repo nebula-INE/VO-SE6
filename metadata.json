@@ -1,0 +1,8 @@
+{
+  "name": "VO-SE Pro Vocal Synthesizer",
+  "description": "Vocal Synthesis Engine and Editor supporting Web Studio and Native PySide6 Desktop",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
