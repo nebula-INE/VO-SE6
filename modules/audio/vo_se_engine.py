@@ -302,8 +302,9 @@ class VO_SE_Engine:
                 for i, note in enumerate(chunk_notes):
                     wav_path = self.oto_map.get(note.lyrics) or self.oto_map.get(note.phonemes)
                     if not wav_path:
-                        wav_path = list(self.oto_map.values())[0] if self.oto_map else ""
-
+                        print(f"[VO_SE_Engine][WARN] 未解決の歌詞をスキップ（無音化）: "
+                              f"lyrics='{note.lyrics}' phonemes='{getattr(note, 'phonemes', None)}'")
+                        continue  # このノートは無音のまま次へ（＝でたらめなサンプルを鳴らさない）
                     res = 128
                     p_curve = self._get_sampled_curve(parameters.get("Pitch", []), note, res, is_pitch=True).astype(np.float64)
                     g_curve = self._get_sampled_curve(parameters.get("Gender", []), note, res).astype(np.float64)
