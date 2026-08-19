@@ -188,24 +188,52 @@ class VO_SE_Engine:
         if not os.path.exists(self.voice_lib_path):
             os.makedirs(self.voice_lib_path, exist_ok=True)
             return
-        
+
+        print(f"[VO_SE_Engine] refresh_voice_library: scanning {self.voice_lib_path}")
+
         self.oto_map = {}
+        collision_count = 0
+
         for root, _, files in os.walk(self.voice_lib_path):
-            # 小文字に統一したファイル名リストを一度だけ作成
             files_lower = [f.lower() for f in files]
-            
-            # 🚀 【最適化フック】このフォルダ内に oto.ini が存在する場合、フォルダの最初で1度だけロード
+
+            oto_aliases = {}  # alias -> filename（このフォルダのoto.iniがあれば埋まる）
             if "oto.ini" in files_lower:
-                # 実際のファイル名（大文字小文字を維持した正しいパス）を取得してパース
                 target_ini = files[files_lower.index("oto.ini")]
                 ini_path = os.path.join(root, target_ini)
                 self.oto_parser.load_oto_file(ini_path)
+                # oto_parser がエイリアス一覧を引ける場合はそれを使う
+                get_aliases = getattr(self.oto_parser, "get_aliases_for_dir", None)
+                if callable(get_aliases):
+                    oto_aliases = get_aliases(ini_path) or {}
 
             for file in files:
-                if file.lower().endswith(".wav"):
-                    lyric = os.path.splitext(file)[0]
-                    self.oto_map[lyric] = os.path.abspath(os.path.join(root, file))
+                if not file.lower().endswith(".wav"):
+                    continue
+                full_path = os.path.abspath(os.path.join(root, file))
+                filename_key = os.path.splitext(file)[0]
 
+                # oto.ini にエイリアス定義があればそちらを優先キーにする
+                keys_to_register = set()
+                for alias, wav_file in oto_aliases.items():
+                    if os.path.splitext(wav_file)[0] == filename_key or wav_file == file:
+                        keys_to_register.add(alias)
+                if not keys_to_register:
+                    keys_to_register.add(filename_key)
+
+                for key in keys_to_register:
+                    existing = self.oto_map.get(key)
+                    if existing and existing != full_path:
+                        collision_count += 1
+                        print(f"[VO_SE_Engine][WARN] oto_map衝突: '{key}' "
+                              f"{os.path.relpath(existing, self.voice_lib_path)} -> "
+                              f"{os.path.relpath(full_path, self.voice_lib_path)} で上書き")
+                    self.oto_map[key] = full_path
+
+        if collision_count:
+            print(f"[VO_SE_Engine][WARN] refresh_voice_library: {collision_count}件のキー衝突を検出。"
+                  f" voice_lib_path='{self.voice_lib_path}' に複数音源が混在している可能性があります。")
+        
     # --- エンコーディング自動判別 ---
     def read_text_safely(self, file_path):
         """USTやoto.iniの文字化けを防ぐ"""
