@@ -2138,17 +2138,34 @@ export default function App() {
               const prevNote = ptr > 0 ? sortedNotes[ptr - 1] : null;
               const isContinuous = prevNote && (note.tick - (prevNote.tick + prevNote.length) <= 240);
               const prevLyric = isContinuous ? prevNote.lyric : undefined;
+              const cacheKey = getSampleCacheKey(targetVb, note.lyric, prevLyric, note.noteNum);
+              const cached = sampleCacheRef.current.get(cacheKey);
 
-              scheduleVocalNoteNode(
-                ctx,
-                targetVb,
-                note,
-                noteStartCtxTime,
-                track.volume ?? 0.8,
-                prevLyric
-              );
+              // 猶予期限: 予定時刻から1.2秒以上遅れてもまだキャッシュが来ないなら、
+              // 曲全体をこれ以上止めないよう諦めてスキップする（安全弁）
+              const graceDeadline = noteStartCtxTime + 1.2;
+
+              if (cached && cached.buffer) {
+                scheduleVocalNoteNode(
+                  ctx,
+                  targetVb,
+                  note,
+                  noteStartCtxTime,
+                  track.volume ?? 0.8,
+                  prevLyric
+                );
+                ptr++;
+              } else if (nowCtx < graceDeadline) {
+                // まだサンプル未取得 → フェッチをキックし、ptrは進めず次tick(25ms後)で再試行
+                fetchAndCacheSample(targetVb, note.lyric, prevLyric, note.noteNum);
+                break;
+              } else {
+                console.warn(`[Scheduler] サンプル取得タイムアウトでノートをスキップ: lyric='${note.lyric}'`);
+                ptr++;
+              }
+            } else {
+              ptr++;
             }
-            ptr++;
           } else {
             break;
           }
