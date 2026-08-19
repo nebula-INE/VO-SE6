@@ -277,8 +277,15 @@ class VO_SE_Engine:
         if total == 0:
             return None
 
-        # 100分割を上限にチャンクサイズを決定（1チャンク最小1ノート）
-        chunk_size = max(1, total // 100) if total > 100 else 1
+        # チャンク分割は進捗表示・キャンセル用に残すが、粒度を大幅に拡大する。
+        # 1ノート=1チャンクだと execute_render がノート間の文脈を一切持たずに
+        # 独立レンダリングするため、継ぎ目ごとに位相・音量が不連続になり
+        # 「プツプツ」というクリック/ポップ音の原因になっていた。
+        MIN_CHUNK_NOTES = 200
+        if total <= MIN_CHUNK_NOTES:
+            chunk_size = total  # 一括レンダリング（継ぎ目ゼロ）
+        else:
+            chunk_size = max(MIN_CHUNK_NOTES, total // 20)  # 最大でも約20分割程度に抑える
 
         # テンポラリディレクトリ
         temp_dir = tempfile.mkdtemp(prefix="vose_render_")
@@ -358,7 +365,19 @@ class VO_SE_Engine:
                 print("[VO_SE_Engine] No audio data rendered.")
                 return None
 
-            final_audio = np.concatenate(combined_audio)
+            # チャンク境界（≒execute_renderの独立呼び出し間）は位相・音量が
+            # 不連続になりがちなので、約8msのイコールパワー・クロスフェードで
+            # 縫い目のクリック/ポップ音を隠す。
+            fade_len = int(0.008 * 44100)  # 約8ms
+            final_audio = combined_audio[0]
+            for nxt in combined_audio[1:]:
+                if len(final_audio) >= fade_len and len(nxt) >= fade_len:
+                    fade_out = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+                    fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+                    overlap = final_audio[-fade_len:] * fade_out + nxt[:fade_len] * fade_in
+                    final_audio = np.concatenate([final_audio[:-fade_len], overlap, nxt[fade_len:]])
+                else:
+                    final_audio = np.concatenate([final_audio, nxt])
             sf.write(file_path, final_audio, 44100)
 
             print(f"[VO_SE_Engine] Render complete: {file_path}")
