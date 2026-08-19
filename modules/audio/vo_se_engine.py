@@ -300,18 +300,38 @@ class VO_SE_Engine:
                     return None
 
                 chunk_notes = notes[start_idx:start_idx + chunk_size]
-                chunk_count = len(chunk_notes)
 
-                # C++ 構造体配列の生成（既存のロジックを流用）
-                c_notes_array = (CNoteEvent * chunk_count)()
-                self._temp_refs = []
-
-                for i, note in enumerate(chunk_notes):
+                # 歌詞が解決できるノートだけを先に選別する。
+                # ★重要★ ここで選別せず c_notes_array[i] を「歌詞なし=continue」で
+                # 飛ばすと、配列はゼロ初期化された ctypes.Structure のままのスロットが
+                # 残り（wav_path=NULL, pitch_curve=NULL 等）、それでも execute_render には
+                # 元のノート数をそのまま渡してしまうため、C++側がNULL構造体を1ノートとして
+                # レンダリングしてしまう（未定義動作＝雑音や別音源っぽいゴミ音の原因）。
+                # なので必ず「配列サイズ」と「execute_renderに渡す件数」を
+                # 実際に書き込んだ件数に一致させる。
+                resolved = []
+                for note in chunk_notes:
                     wav_path = self.oto_map.get(note.lyrics) or self.oto_map.get(note.phonemes)
                     if not wav_path:
                         print(f"[VO_SE_Engine][WARN] 未解決の歌詞をスキップ（無音化）: "
                               f"lyrics='{note.lyrics}' phonemes='{getattr(note, 'phonemes', None)}'")
-                        continue  # このノートは無音のまま次へ（＝でたらめなサンプルを鳴らさない）
+                        continue
+                    resolved.append((note, wav_path))
+
+                chunk_count = len(resolved)
+                if chunk_count == 0:
+                    # このチャンクに有効なノートが1つも無い場合は execute_render 自体を呼ばない
+                    if progress_callback:
+                        processed = min(start_idx + len(chunk_notes), total)
+                        percent = int((processed / total) * 100)
+                        progress_callback(percent)
+                    continue
+
+                # C++ 構造体配列は「実際に解決できた件数」ぴったりのサイズで作る
+                c_notes_array = (CNoteEvent * chunk_count)()
+                self._temp_refs = []
+
+                for i, (note, wav_path) in enumerate(resolved):
                     res = 128
                     p_curve = self._get_sampled_curve(parameters.get("Pitch", []), note, res, is_pitch=True).astype(np.float64)
                     g_curve = self._get_sampled_curve(parameters.get("Gender", []), note, res).astype(np.float64)
@@ -338,7 +358,7 @@ class VO_SE_Engine:
                 # チャンク用の一時WAVパス
                 chunk_path = os.path.join(temp_dir, f"chunk_{start_idx:06d}.wav")
 
-                # C++ エンジン実行
+                # C++ エンジン実行（渡す件数は必ず c_notes_array の実サイズと一致させる）
                 self.lib.execute_render(
                     c_notes_array,
                     chunk_count,
@@ -354,9 +374,10 @@ class VO_SE_Engine:
                     combined_audio.append(data)
                     chunk_files.append(chunk_path)
 
-                # 進捗更新
+                # 進捗更新（進捗の分母は「元のチャンクの読み進み」基準。
+                # chunk_count は歌詞解決後の件数なので進捗計算には使わない）
                 if progress_callback:
-                    processed = min(start_idx + chunk_count, total)
+                    processed = min(start_idx + len(chunk_notes), total)
                     percent = int((processed / total) * 100)
                     progress_callback(percent)
 
