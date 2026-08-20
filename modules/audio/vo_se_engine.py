@@ -197,6 +197,13 @@ class VO_SE_Engine:
         for root, _, files in os.walk(self.voice_lib_path):
             files_lower = [f.lower() for f in files]
 
+            # UTAUの複数音域（マルチピッチ）音源では Lyric= 側が
+            # "サブフォルダ名\エイリアス"（例: "do-dai\あー_D4"）という形式で
+            # 音域フォルダを指定してくる。ルート直下ではない場合はこのプレフィックスも
+            # 登録しないと絶対に一致しない（→無音スキップ／代打雑音の原因だった）。
+            rel_dir = os.path.relpath(root, self.voice_lib_path)
+            subdir_prefix = "" if rel_dir in (".", "") else rel_dir.replace(os.sep, "\\") + "\\"
+
             oto_aliases = {}  # alias -> filename（このフォルダのoto.iniがあれば埋まる）
             if "oto.ini" in files_lower:
                 target_ini = files[files_lower.index("oto.ini")]
@@ -220,6 +227,11 @@ class VO_SE_Engine:
                         keys_to_register.add(alias)
                 if not keys_to_register:
                     keys_to_register.add(filename_key)
+
+                # サブフォルダ内のファイルは "サブフォルダ\エイリアス" 形式でも登録する
+                if subdir_prefix:
+                    for key in list(keys_to_register):
+                        keys_to_register.add(subdir_prefix + key)
 
                 for key in keys_to_register:
                     existing = self.oto_map.get(key)
