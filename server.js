@@ -129,6 +129,12 @@ async function parseOtoIniFull(dirPath) {
       return;
     }
 
+    // UTAUの複数音域（マルチピッチ）音源は .ust の Lyric= が
+    // "サブフォルダ名\エイリアス"（例: "do-dai\あー_D4"）という形式で
+    // 音域フォルダを指定してくる。ルート直下のoto.iniなら subdirPrefix は空。
+    const relDir = path.relative(dirPath, currentDir);
+    const subdirPrefix = relDir ? relDir.split(path.sep).join('\\') + '\\' : '';
+
     for (const file of files) {
       const fullPath = path.join(currentDir, file.name);
 
@@ -199,6 +205,20 @@ async function parseOtoIniFull(dirPath) {
           const baseNameNoExt = path.basename(filename).replace(/\.wav$/i, '');
           if (baseNameNoExt && !result.aliasMap.has(baseNameNoExt)) {
             result.aliasMap.set(baseNameNoExt, entryObj);
+          }
+          // サブフォルダ内なら "サブフォルダ\エイリアス" / "サブフォルダ\ファイル名" 形式でも登録
+          // （.ust の Lyric= がこの形式で音域フォルダを指定してくるため）
+          if (subdirPrefix) {
+            const prefixedAlias = subdirPrefix + alias;
+            if (!result.aliasMap.has(prefixedAlias)) {
+              result.aliasMap.set(prefixedAlias, entryObj);
+            }
+            if (baseNameNoExt) {
+              const prefixedBaseName = subdirPrefix + baseNameNoExt;
+              if (!result.aliasMap.has(prefixedBaseName)) {
+                result.aliasMap.set(prefixedBaseName, entryObj);
+              }
+            }
           }
 
           // ★重要: 巨大なVCV音源（oto.ini 1本で数千〜1万行）でも
