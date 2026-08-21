@@ -633,6 +633,9 @@ export default function App() {
     baseMidi: number;
   } | null>>(new Map());
   const sampleInFlightRef = useRef<Map<string, Promise<any>>>(new Map());
+  // 診断用: 今回の再生セッションでサンプル解決に失敗したエイリアスを記録する
+  // (alias -> 発生回数)。devtoolsが使いにくい環境でも画面上のトーストで確認できるようにする。
+  const unresolvedAliasesRef = useRef<Map<string, number>>(new Map());
 
   interface ActiveAudioNode {
     stop: () => void;
@@ -746,6 +749,9 @@ export default function App() {
         await ctx.resume();
       }
 
+      // 診断用: 今回の再生セッション分をクリア
+      unresolvedAliasesRef.current.clear();
+
       // Collect active tracks to play
       const hasSolo = tracks.some(t => t.isSolo);
       const activeTracks = hasSolo
@@ -809,7 +815,27 @@ export default function App() {
     } else {
       setIsPlaying(false);
       setCurrentTick(currentTickRef.current);
+      showUnresolvedAliasToastIfAny();
     }
+  };
+
+  // 診断用: 再生セッション中にサンプル解決へ失敗したエイリアスがあれば
+  // 画面上のトーストで一覧表示する（devtoolsが使いにくい環境向け）
+  const showUnresolvedAliasToastIfAny = () => {
+    const failed = unresolvedAliasesRef.current;
+    if (failed.size === 0) return;
+    const entries: [string, number][] = Array.from(failed.entries()).sort((a: [string, number], b: [string, number]) => b[1] - a[1]);
+    const totalHits = entries.reduce((sum, [, count]) => sum + count, 0);
+    const preview = entries
+      .slice(0, 8)
+      .map(([alias, count]) => `${alias}${count > 1 ? `×${count}` : ''}`)
+      .join(', ');
+    const more = entries.length > 8 ? ` 他${entries.length - 8}種` : '';
+    setToast({
+      type: 'error',
+      title: `未解決エイリアス: ${entries.length}種 / 計${totalHits}件`,
+      desc: `解決できなかった歌詞: ${preview}${more}`
+    });
   };
 
   const fetchVoicebanks = async () => {
@@ -896,6 +922,11 @@ export default function App() {
         const res = await fetch(url);
         if (!res.ok) {
           sampleCacheRef.current.set(cacheKey, null);
+          // 診断用: 解決失敗を記録（同じエイリアスの再試行分も回数としてカウント）
+          unresolvedAliasesRef.current.set(
+            alias,
+            (unresolvedAliasesRef.current.get(alias) || 0) + 1
+          );
           return null;
         }
 
@@ -2193,6 +2224,7 @@ export default function App() {
 
       if (calculatedTick >= songMaxTick) {
         setIsPlaying(false);
+        showUnresolvedAliasToastIfAny();
         activeAudioNodesRef.current.forEach((node) => {
           try {
             node.stop();
