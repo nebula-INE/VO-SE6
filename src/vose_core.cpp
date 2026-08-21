@@ -38,6 +38,11 @@ using VoseUniqueLock = std::unique_lock<std::mutex>;
 
 // --- Windows (MSVC) と POSIX (macOS/Linux) のクロスプラットフォーム吸収マクロ ---
 #if defined(_WIN32) || defined(_WIN64)
+#  define WIN32_LEAN_AND_MEAN  // windows.hによる余計なヘッダ巻き込みを抑制
+#  ifndef NOMINMAX
+#    define NOMINMAX           // std::min/std::maxとの衝突を防ぐ(このファイルで多用しているため必須)
+#  endif
+#  include <windows.h>         // MultiByteToWideChar (UTF-8→UTF-16変換) 用
 #  include <io.h>
 #  include <process.h>
 #  include <direct.h>     // Windowsの_mkdir用
@@ -1728,6 +1733,38 @@ namespace {
 }
 #endif
 
+#if defined(_WIN32) || defined(_WIN64)
+// UTF-8(char*)をWindows API(Ort::Sessionのwchar_tコンストラクタ等)が要求する
+// UTF-16(wstring)へ正しく変換する。
+//
+// [修正前のバグ] 旧実装は
+//     std::wstring wpath(onnx_path, onnx_path + strlen(onnx_path));
+// のように char を1バイトずつ wchar_t へ広げているだけだった。これは
+// UTF-8→UTF-16変換ではなくLatin-1相当の単純拡張でしかないため、
+// 日本語を含むパス(例: C:\Users\田中\models\bigvgan.onnx)を渡すと
+// 文字化けし、ファイルが見つからずモデルロードに失敗していた。
+//
+// MB_ERR_INVALID_CHARS: 不正なUTF-8シーケンスがあった場合、黙って
+// 文字を落とす/置換するのではなく変換自体を失敗(戻り値0)させる。
+// ファイルパスの変換では「化けたパスで開こうとして原因不明のエラーになる」
+// より「変換失敗を早期に検知する」方が診断しやすいため、あえて厳格にしている。
+static std::wstring utf8_to_wstring(const char* utf8_str) {
+    if (!utf8_str || utf8_str[0] == '\0') return std::wstring();
+
+    const int required_len = MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, utf8_str, -1, nullptr, 0);
+    if (required_len <= 1) {
+        // 0: 変換失敗(不正なUTF-8)。1: NUL終端のみ(=元が空文字列、既に上でreturn済のはずだが念のため)。
+        return std::wstring();
+    }
+
+    // required_lenはNUL終端を含む長さなので、wstring自体の長さは-1する。
+    std::wstring wide_str(static_cast<size_t>(required_len) - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8_str, -1, &wide_str[0], required_len);
+    return wide_str;
+}
+#endif
+
 // BigVGAN ONNXモデルのパスを設定する（init_official_engine から呼ぶ）
 // path が nullptr または空なら BigVGAN を無効化する
 extern "C" DLLEXPORT void set_bigvgan_model(const char* onnx_path) {
@@ -1742,7 +1779,14 @@ extern "C" DLLEXPORT void set_bigvgan_model(const char* onnx_path) {
             static_cast<int>(std::max(1u, std::thread::hardware_concurrency())));
         g_ort_opts.SetGraphOptimizationLevel(ORT_ENABLE_ALL);
 #ifdef _WIN32
-        const std::wstring wpath(onnx_path, onnx_path + strlen(onnx_path));
+        const std::wstring wpath = utf8_to_wstring(onnx_path);
+        if (wpath.empty()) {
+            // onnx_pathは上のチェックで非空と分かっているので、ここに来るのは
+            // 不正なUTF-8シーケンスによる変換失敗のみ。
+            fprintf(stderr, "[BigVGAN] Failed to convert path to UTF-16 (invalid UTF-8?): %s\n", onnx_path);
+            g_bigvgan_session.reset();
+            return;
+        }
         g_bigvgan_session = std::make_unique<Ort::Session>(g_ort_env, wpath.c_str(), g_ort_opts);
 #else
         g_bigvgan_session = std::make_unique<Ort::Session>(g_ort_env, onnx_path, g_ort_opts);
