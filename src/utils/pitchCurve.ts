@@ -50,21 +50,17 @@ export function parsePitchBend(pbs: string, pbw: string, pby: string): PitchPoin
     .filter((s) => s.length > 0)
     .map(parseNumeric);
 
-  // UTAU形式のピッチスケール自動判定 (0.1半音単位・セント・実半音):
-  // - UTAU標準のUSTファイル: PBY や PBS は「0.1半音単位 (10 = 1半音, 100 = 10半音, 120 = 1オクターブ)」
-  // - セント単位のファイル: 100 = 1半音 (1200 = 1オクターブ)
-  // - 当エディタ保存時や直接半音指定: 1.0 = 1半音
-  const allRawValues = [rawStartSemitone, ...rawHeights];
-  const maxAbsVal = allRawValues.reduce((max, v) => Math.max(max, Math.abs(v)), 0);
-
-  let scaleFactor = 1.0;
-  if (maxAbsVal > 150) {
-    // セント単位 (100セント = 1半音)
-    scaleFactor = 0.01;
-  } else if (maxAbsVal > 15) {
-    // UTAU標準 0.1半音単位 (10 = 1半音)
-    scaleFactor = 0.1;
-  }
+  // UST/UTAU標準仕様: PBS/PBYの単位は常に固定で「10 = 1半音」。
+  //
+  // ★重要: 以前はノートごとの生値の最大絶対値からセント/0.1半音/実半音を
+  // "自動判定" していたが、これは根本的に誤り。ベンドの深さ（大きいか小さいか）と
+  // 数値の単位（何を1半音とみなすか）は無関係で、ファイル内では常に固定のはず。
+  // この誤判定により、穏やかなビブラートやしゃくり等の小さい生値
+  // （例: -14.3, 6.7 など、ノート内の最大絶対値が15以下のケース）が
+  // 「もう半音そのもの」と誤認識され、-14.3半音・6.7半音という
+  // 物理的にありえない急激なピッチジャンプとして適用されてしまっていた
+  // （実際は -1.43半音・0.67半音程度の穏やかなベンドのはずだった）。
+  const scaleFactor = 0.1;
 
   // ノート開始位置からの相対時間・半音の安全クランプ (±24半音 = ±2オクターブ内に厳格制限)
   const clampedStartOffset = Math.max(-3000, Math.min(10000, startOffsetMs));
