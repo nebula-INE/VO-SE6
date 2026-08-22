@@ -1916,9 +1916,24 @@ export default function App() {
         const volGain = Math.max(0.05, Math.min(1.5, (note.intensity || 120) / 120)) * 0.92 * Math.min(1.5, trackVol);
 
         const tStart = Math.max(ctx.currentTime, actualStartTime);
-        const tAttack = Math.max(tStart + 0.008, noteStartCtxTime);
-        const tDecay = Math.max(tAttack + 0.005, noteStartCtxTime + durSec - 0.015);
-        const tEnd = tDecay + 0.025;
+
+        // ★修正: 以前はアタック完了を常に "拍そのもの (noteStartCtxTime)" に固定していたため、
+        // 次のノートが拍の時点で既にフルボリュームである一方、前のノートのフェードアウトが
+        // 拍境界を最大10ms過ぎてから完了する設計になっていた。結果、拍境界の前後で
+        // 隣接する2つの別音素が両方ともフルボリュームで同時に鳴る瞬間が生まれ、
+        // 「ブツッ」という衝突音の原因になっていた。
+        // oto.ini の Overlap（前のノートとクロスフェードする長さ）を使って、
+        // アタックは実際の音声開始位置(tStart)からOverlap分だけで完了させる。
+        const overlapSec = Math.max(0, (cached.overlap || 0) / 1000) / baseRate;
+        const attackDur = Math.max(0.006, Math.min(0.03, overlapSec || 0.008));
+        const tAttack = tStart + attackDur;
+
+        // フェードアウトは必ずノート自身の終了時刻(noteStartCtxTime + durSec)までに
+        // 完了させ、次のノートの領域へ音量が食い込まないようにする。
+        const noteEndTime = noteStartCtxTime + durSec;
+        const releaseDur = 0.015;
+        const tDecay = Math.max(tAttack + 0.003, noteEndTime - releaseDur);
+        const tEnd = Math.min(tDecay + releaseDur, noteEndTime);
 
         gain.gain.setValueAtTime(0.0001, tStart);
         gain.gain.linearRampToValueAtTime(volGain, tAttack);
