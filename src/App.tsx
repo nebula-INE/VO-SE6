@@ -1760,6 +1760,55 @@ export default function App() {
   };
 
   // Core Note Vocal Audio Node Scheduler (WAV Voicebank with Pitch Bends & Formant Synth Fallback)
+  // AudioBufferSourceNode.loop はサンプル単位のハードループで、クロスフェードを一切
+  // 行わない。UTAU系音源のサステイン区間（母音の伸ばし部分）を単純にループすると、
+  // loopStart/loopEnd がちょうど同じ位相・振幅で一致することはまず無いため、
+  // ループ1周ごとに波形が不連続にジャンプ＝「ブツッ」というクリック音が鳴り続ける。
+  // これを防ぐため、ループ終端の直前を、ループ始点直後の波形とイコールパワーで
+  // ブレンドした専用バッファを作る。alias+loop位置ごとに一度だけ計算してキャッシュに
+  // ぶら下げておく（毎ノート再計算しない）。共有キャッシュの元バッファ自体は書き換えない。
+  const getLoopCrossfadedBuffer = (
+    ctx: AudioContext,
+    cached: any,
+    loopStartSec: number,
+    loopEndSec: number
+  ): AudioBuffer => {
+    const key = `${loopStartSec.toFixed(4)}_${loopEndSec.toFixed(4)}`;
+    if (!cached._loopXfadeCache) {
+      cached._loopXfadeCache = new Map<string, AudioBuffer>();
+    }
+    const existing = cached._loopXfadeCache.get(key);
+    if (existing) return existing;
+
+    const src: AudioBuffer = cached.buffer;
+    const sr = src.sampleRate;
+    const loopLenSec = Math.max(0.001, loopEndSec - loopStartSec);
+    const xfadeSec = Math.min(0.015, loopLenSec * 0.25); // 最大15ms、ループ幅の25%まで
+    const xfadeSamples = Math.max(1, Math.floor(xfadeSec * sr));
+    const loopStartSample = Math.max(0, Math.floor(loopStartSec * sr));
+    const loopEndSample = Math.min(src.length, Math.floor(loopEndSec * sr));
+
+    const newBuffer = ctx.createBuffer(src.numberOfChannels, src.length, sr);
+    for (let ch = 0; ch < src.numberOfChannels; ch++) {
+      const srcData = src.getChannelData(ch);
+      const dstData = newBuffer.getChannelData(ch);
+      dstData.set(srcData);
+
+      for (let i = 0; i < xfadeSamples; i++) {
+        const tailIdx = loopEndSample - xfadeSamples + i;
+        const headIdx = loopStartSample + i;
+        if (tailIdx < 0 || tailIdx >= src.length || headIdx >= src.length) continue;
+        const t = i / xfadeSamples;
+        const fadeOut = Math.cos((t * Math.PI) / 2);
+        const fadeIn = Math.sin((t * Math.PI) / 2);
+        dstData[tailIdx] = srcData[tailIdx] * fadeOut + srcData[headIdx] * fadeIn;
+      }
+    }
+
+    cached._loopXfadeCache.set(key, newBuffer);
+    return newBuffer;
+  };
+
   const scheduleVocalNoteNode = (
     ctx: AudioContext,
     targetVb: string,
@@ -1854,6 +1903,12 @@ export default function App() {
             source.loop = true;
             source.loopStart = loopStartSec;
             source.loopEnd = loopEndSec;
+            // ループ境界のクリック音を消すため、クロスフェード済みバッファに差し替える
+            try {
+              source.buffer = getLoopCrossfadedBuffer(ctx, cached, loopStartSec, loopEndSec);
+            } catch (e) {
+              // 失敗しても元のバッファのまま続行（無音になるよりはクリック音の方がまし）
+            }
           }
         }
 
