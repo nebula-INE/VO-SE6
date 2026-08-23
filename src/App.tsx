@@ -922,11 +922,16 @@ export default function App() {
         const res = await fetch(url);
         if (!res.ok) {
           sampleCacheRef.current.set(cacheKey, null);
-          // 診断用: 解決失敗を記録（同じエイリアスの再試行分も回数としてカウント）
-          unresolvedAliasesRef.current.set(
-            alias,
-            (unresolvedAliasesRef.current.get(alias) || 0) + 1
-          );
+          // 診断用: 解決失敗を記録する。ただし「っ」「ッ」（促音）は単独サンプルを
+          // 持たない音源が多く、無音として扱われるのが仕様上正常なケースなので、
+          // 実際に問題がある未解決エイリアスと区別するため診断対象から除外する。
+          const isExpectedGlottalStop = alias === 'っ' || alias === 'ッ';
+          if (!isExpectedGlottalStop) {
+            unresolvedAliasesRef.current.set(
+              alias,
+              (unresolvedAliasesRef.current.get(alias) || 0) + 1
+            );
+          }
           return null;
         }
 
