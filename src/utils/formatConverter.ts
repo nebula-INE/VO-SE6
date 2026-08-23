@@ -165,6 +165,38 @@ export function parseUstText(text: string): ProjectData {
     if (!inNote) return;
 
     const trimmedLyric = curLyric.trim();
+
+    // UTAUの「タイ（継続）ノート」記法: Lyric="+" は新しい音素を発音せず、
+    // 直前のノートの発音をそのまま継続する（ピッチカーブだけを追加で乗せることが多い）。
+    // これを普通の歌詞として音源解決しようとすると、音源には存在しないエイリアスなので
+    // 必ず失敗し、その区間が余計な無音になってしまっていた。
+    // 正しくは: 新規ノートを作らず、直前のノートの長さを延長し、
+    // このノート自身のPBS/PBW/PBYを直前ノートの続きとして結合する。
+    if (trimmedLyric === '+') {
+      if (notes.length > 0) {
+        const prevNote = notes[notes.length - 1];
+        const prevLengthMs = (prevNote.length / 480) * (60000 / (tempo || 120));
+
+        if (curPbs || curPbw || curPby) {
+          const prevPoints = parsePitchBend(prevNote.pbs, prevNote.pbw, prevNote.pby);
+          const tiePoints = parsePitchBend(curPbs, curPbw, curPby).map((p) => ({
+            offsetMs: p.offsetMs + prevLengthMs,
+            semitone: p.semitone
+          }));
+          // タイノートのPBSは直前ノートの領域に食い込む負のオフセットを持つことがある
+          // (滑らかなポルタメントとして正しい挙動)ため、結合後は時系列順に並べ直す。
+          const mergedPoints = [...prevPoints, ...tiePoints].sort((a, b) => a.offsetMs - b.offsetMs);
+          const merged = serializePitchBend(mergedPoints);
+          prevNote.pbs = merged.pbs;
+          prevNote.pbw = merged.pbw;
+          prevNote.pby = merged.pby;
+        }
+        prevNote.length = Math.max(1, prevNote.length) + Math.max(1, curLength);
+      }
+      currentTick += Math.max(1, curLength);
+      return;
+    }
+
     // In UTAU, Rest notes are strictly R, r, 休符, null or empty. Note: "ー" is NOT a rest in UTAU songs!
     const isRest = (
       trimmedLyric === 'R' ||
@@ -187,8 +219,10 @@ export function parseUstText(text: string): ProjectData {
       if ((!curPbs || curPbs === '0;0') && (!curPby || curPby === '0') && curPitches) {
         const pitchList = curPitches.split(',').map((s) => parseFloat(s.trim())).filter((n) => !isNaN(n));
         if (pitchList.length > 1) {
-          const maxVal = pitchList.reduce((max, n) => Math.max(max, Math.abs(n)), 0);
-          const factor = maxVal > 150 ? 0.01 : (maxVal > 15 ? 0.1 : 1.0);
+          // UST/UTAU標準仕様: 単位は常に固定で「10 = 1半音」。
+          // (以前はノート内の最大絶対値でセント/0.1半音/実半音を"自動判定"していたが、
+          //  これは pitchCurve.ts と同じ根本原因のバグ。ベンドの深さと単位は無関係)
+          const factor = 0.1;
           const stepMs = Math.max(10, Math.round(((curLength / 480) * (60000 / (tempo || 120))) / pitchList.length));
           const stepSample = Math.max(1, Math.floor(pitchList.length / 6));
           const pts: PitchPoint[] = [];
