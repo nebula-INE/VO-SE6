@@ -305,6 +305,19 @@ class VoicebankRegistryEngine {
 
     this.cache.set(vbName, indexed);
 
+    // ★修正: detectWavBaseMidi() は .frq ファイルも無くピッチタグも無いwavに対して
+    // ブルートフォースの自己相関ピッチ検出（O(サンプル数×ラグ数)、数百万回の
+    // 乗算加算）を行う。これは結果をキャッシュしているものの、初回は
+    // /api/py/voicebank-sample のリクエストハンドラ内で同期的に実行されるため、
+    // Node.jsのイベントループ全体を数十ms単位でブロックしてしまい、
+    // 再生中に新しいエイリアスへ初めてアクセスするたびに他の並行リクエストまで
+    // 詰まらせる原因になっていた（プレビュー再生が「つっかえる」症状と一致）。
+    // インデックス直後にバックグラウンドで全エントリぶん先にウォームアップして
+    // おくことで、実際の再生リクエストが来る頃には既にキャッシュ済みにする。
+    if (this.warmBaseMidiCache) {
+      setImmediate(() => this.warmBaseMidiCache(indexed));
+    }
+
     // ★修正: 解析「後」にもサイズをチェックし、古いものから個別に間引く
     while (this.cache.size > this.maxCached) {
       const oldestKey = this.cache.keys().next().value;
@@ -1131,6 +1144,32 @@ function detectWavBaseMidi(wavPath, alias = '', filename = '') {
   if (wavPath) wavBaseMidiCache.set(wavPath, fallback);
   return fallback;
 }
+
+// ★修正: 音源インデックス直後にバックグラウンドで detectWavBaseMidi の
+// キャッシュを温めておく。1リクエストあたりの重い自己相関計算で
+// イベントループを長時間ブロックしないよう、少数件ずつ setImmediate で
+// 制御を返しながら進める（walkDir の YIELD_EVERY_LINES と同じ考え方）。
+vbRegistry.warmBaseMidiCache = (indexed) => {
+  const entries = (indexed && indexed.entries) || [];
+  const WARM_BATCH_SIZE = 20;
+  let i = 0;
+  const step = () => {
+    const end = Math.min(entries.length, i + WARM_BATCH_SIZE);
+    for (; i < end; i++) {
+      const e = entries[i];
+      if (!e || !e.wav_path) continue;
+      try {
+        detectWavBaseMidi(e.wav_path, e.alias, e.filename);
+      } catch (err) {
+        // ウォームアップの失敗は無視（実リクエスト時に通常経路で再試行される）
+      }
+    }
+    if (i < entries.length) {
+      setImmediate(step);
+    }
+  };
+  setImmediate(step);
+};
 
 function getMidiFromPitchTag(str) {
   if (!str) return 60;
