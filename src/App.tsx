@@ -764,15 +764,26 @@ export default function App() {
 
       const uniqueKeys = new Map<string, { vb: string; lyric: string; prevLyric?: string; noteNum?: number }>();
 
+      // ★修正: 以前はここで曲全体(tick=0から末尾まで)を一括スキャンしてユニーク音節を
+      // 集め、再生開始直後にバックグラウンドで「曲全体ぶん」を延々フェッチし続けていた。
+      // これは scheduleAhead 側に既にある「再生位置から4秒先まで」の先読みプリフェッチと
+      // 完全に重複しており、ブラウザの同時接続数を奪い合って本当に直近で必要な
+      // フェッチが後回しになる（＝プレビューだけ詰まる）原因になっていた。
+      // ここでは「再生開始位置(currentTick)から直後の数十ノート分」だけを対象にし、
+      // それより先は scheduleAhead の継続的な先読みに任せる。
+      const PRESTART_LOOKAHEAD_NOTES = 30;
       activeTracks.forEach(t => {
         const sorted = [...t.notes].sort((a, b) => a.tick - b.tick);
         sortedTrackNotesRef.current.set(t.id, sorted);
         const idx = sorted.findIndex(n => n.tick + (n.length || 480) >= currentTick);
-        trackSchedulePointersRef.current.set(t.id, idx >= 0 ? idx : sorted.length);
+        const startIdx = idx >= 0 ? idx : sorted.length;
+        trackSchedulePointersRef.current.set(t.id, startIdx);
 
         const vb = t.voicebank || selectedVoicebank || (customVoicebanks.length > 0 ? customVoicebanks[0].name : '');
-        sorted.forEach((n, i) => {
-          if (isRestLyric(n.lyric)) return;
+        const endIdx = Math.min(sorted.length, startIdx + PRESTART_LOOKAHEAD_NOTES);
+        for (let i = startIdx; i < endIdx; i++) {
+          const n = sorted[i];
+          if (isRestLyric(n.lyric)) continue;
           const prevNote = i > 0 ? sorted[i - 1] : null;
           const isContinuous = prevNote && (n.tick - (prevNote.tick + prevNote.length) <= 240);
           const prevLyric = isContinuous ? prevNote.lyric : undefined;
@@ -780,10 +791,10 @@ export default function App() {
           if (!uniqueKeys.has(k)) {
             uniqueKeys.set(k, { vb, lyric: n.lyric, prevLyric, noteNum: n.noteNum });
           }
-        });
+        }
       });
 
-      // Quick pre-fetch starting phonemes near currentTick so start has zero delay
+      // 再生開始位置直後の音だけ、確実に用意してから再生を始める
       const items = Array.from(uniqueKeys.values());
       const BATCH_SIZE = 8;
       const initialBatch = items.slice(0, BATCH_SIZE);
@@ -791,7 +802,9 @@ export default function App() {
         initialBatch.map(item => fetchAndCacheSample(item.vb, item.lyric, item.prevLyric, item.noteNum))
       );
 
-      // Stream remaining unique phonemes in background
+      // 初回バッチに入りきらなかった直近分は、再生を止めずにバックグラウンドで続きを取得
+      // (曲全体ではなく、あくまで PRESTART_LOOKAHEAD_NOTES 分のみ。それ以降は
+      //  scheduleAhead の4秒先読みプリフェッチが継続的に担当する)
       if (items.length > BATCH_SIZE) {
         (async () => {
           for (let i = BATCH_SIZE; i < items.length; i += BATCH_SIZE) {
