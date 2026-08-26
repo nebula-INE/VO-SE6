@@ -25,6 +25,7 @@
 #include <shared_mutex>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 
 // --- clamp polyfill (for C++14/macOS libc++) ---
 // [修正] <algorithm> を読み込んだ「後」に判定する。
@@ -491,6 +492,53 @@ static int64_t note_samples_safe(int p) {
 }
 
 // ============================================================
+// parse_pitch_tag_hz
+//
+// UTAU系音源のファイル名/エイリアスにはしばしば "あー_D4" "い_F#4_2" のように
+// 録音時のピッチタグが付与されている。これはCheapTrick/Harvestの解析結果
+// (フレーム平均)よりもはるかに信頼できる「そのサンプルの本来のピッチ」情報
+// なので、apply_gender_shift の基準F0(base_f0)にはこちらを優先して使う。
+// 見つからなければ 0.0 を返し、呼び出し側は従来の解析平均にフォールバックする。
+// ============================================================
+static double parse_pitch_tag_hz(const std::string& path)
+{
+    // ファイル名部分だけを見る（ディレクトリ名にたまたま数字が含まれる誤検出を避ける）
+    std::string name = path;
+    const size_t slash = name.find_last_of("/\\");
+    if (slash != std::string::npos) name = name.substr(slash + 1);
+
+    // 例: "あー_D4", "い_F#4_2", "do-dai_C#5.wav" のような末尾寄りのパターンを探す。
+    // [A-Ga-g][#b]?[0-9] という並びを後ろから探し、直後に数字が続く場合は
+    // それも含めて「オクターブ番号」として解釈する（例: "D10" のような2桁対応）。
+    for (size_t i = 0; i + 1 < name.size(); ++i) {
+        char c = name[i];
+        char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (upper < 'A' || upper > 'G') continue;
+
+        size_t j = i + 1;
+        int accidental = 0; // 0=natural, 1=sharp, -1=flat
+        if (j < name.size() && (name[j] == '#')) { accidental = 1; ++j; }
+        else if (j < name.size() && (name[j] == 'b')) { accidental = -1; ++j; }
+
+        if (j >= name.size() || !std::isdigit(static_cast<unsigned char>(name[j]))) continue;
+
+        size_t k = j;
+        while (k < name.size() && std::isdigit(static_cast<unsigned char>(name[k]))) ++k;
+        int octave = std::atoi(name.substr(j, k - j).c_str());
+
+        static const int kSemitoneFromC[7] = {9, 11, 0, 2, 4, 5, 7}; // A,B,C,D,E,F,G
+        const int letterIdx = upper - 'A';
+        const int semitone = kSemitoneFromC[letterIdx] + accidental;
+        const int midi = (octave + 1) * 12 + semitone; // MIDI: C4=60 (オクターブ表記はC4基準)
+
+        if (midi < 0 || midi > 127) continue; // 明らかに誤検出（無関係な英数字列）なら無視
+
+        return 440.0 * std::pow(2.0, (midi - 69) / 12.0);
+    }
+    return 0.0;
+}
+
+// ============================================================
 // find_voice_ref
 // ============================================================
 
@@ -868,8 +916,26 @@ void apply_gender_shift(double* sr, int spec_bins, double gender,
 
     // 高音域補正: F0 が上がるほどスペクトルを引き伸ばす
     // 補正量は F0 比の 0.5 乗（完全追従は 1.0 乗だが過補正になるので 0.5 が自然）
-    const double formant_ratio = (f0_ratio > 0.0)
-        ? std::pow(f0_ratio, 0.5) : 1.0;
+    //
+    // ★修正: 以前は f0_ratio^0.5 をそのまま使っており、上限が無かったため
+    // 音源の基準ピッチから大きく離れた高音（例: 1オクターブ上 → f0_ratio=2.0 →
+    // formant_ratio≈1.41、フォルマントを41%も引き伸ばす）で音色が激変していた。
+    // ここで対数半音差を ±1オクターブにソフトクランプ(tanh)してから指数を適用し、
+    // 極端な音域差でも暴走しないようにする。
+    double formant_ratio = 1.0;
+    if (f0_ratio > 0.0) {
+        const double log2_ratio = std::log2(f0_ratio);
+        constexpr double kSoftLimitOct = 1.0; // ここまではほぼリニア
+        constexpr double kHardLimitOct = 1.6; // これ以上は緩やかに頭打ち
+        double clamped_log2 = log2_ratio;
+        if (std::abs(log2_ratio) > kSoftLimitOct) {
+            const double sign    = log2_ratio >= 0.0 ? 1.0 : -1.0;
+            const double excess  = std::abs(log2_ratio) - kSoftLimitOct;
+            const double headroom = kHardLimitOct - kSoftLimitOct;
+            clamped_log2 = sign * (kSoftLimitOct + headroom * std::tanh(excess / headroom));
+        }
+        formant_ratio = std::pow(2.0, clamped_log2 * 0.5);
+    }
 
     const double shift_ratio = gender_ratio * formant_ratio;
 
@@ -1167,10 +1233,14 @@ void synthesize_note_impl(const SynthNoteParams& p, std::vector<double>& note_bu
 
     auto cache_cur = get_or_analyze(pp.ev, fft_size, spec_bins);
 
-    // フォルマント追従用: 音源の基準F0（解析時の有声フレーム平均）を計算
-    // これを各フレームのF0と比較してスペクトルの引き伸ばし量を決める
-    double base_f0 = 0.0;
-    {
+    // フォルマント追従用: 音源の基準F0を求める。
+    // ★修正: 以前は解析(CheapTrick/Harvest)の有声フレーム単純平均のみを
+    // 使っており、子音部や語尾の不安定なピッチも均等に混ざるため基準自体が
+    // ブレやすかった。ファイル名に "あー_D4" のようなピッチタグが付いている
+    // 場合はそちらの方がはるかに信頼できるので優先し、見つからない場合のみ
+    // 従来の解析平均にフォールバックする。
+    double base_f0 = parse_pitch_tag_hz(pp.ev->path);
+    if (base_f0 <= 0.0) {
         int voiced = 0;
         for (int j = 0; j < cache_cur->length; ++j) {
             if (cache_cur->f0[j] > 50.0) { base_f0 += cache_cur->f0[j]; ++voiced; }
