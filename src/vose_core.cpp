@@ -26,6 +26,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <functional>
 
 // --- clamp polyfill (for C++14/macOS libc++) ---
 // [修正] <algorithm> を読み込んだ「後」に判定する。
@@ -1039,10 +1040,17 @@ void apply_vibrato(double* f0, int f0_length, double frame_period_ms,
     constexpr double kVibFreqDef  = 6.0;
     const double     frame_sec    = frame_period_ms / 1000.0;
 
+    // ★修正: 以前はレート・深さが完全固定の純粋なサイン波で、
+    // フェードインも min(t*4,1) の直線ランプだった。本物の声のビブラートは
+    // レート・深さともに緩やかに揺れており、立ち上がりも直線的ではないため
+    // 機械的に聞こえていた。ここでは低周波(0.7Hz程度)のゆっくりした揺らぎを
+    // レート・深さそれぞれに重畳し、フェードインもイーズイン(3次)にする。
     for (int j = vib_start; j < f0_length; ++j) {
         const double fade_progress =
             static_cast<double>(j - vib_start) / std::max(vib_len - 1, 1);
-        const double fade_in = std::min(fade_progress * 4.0, 1.0);
+        // 直線ランプ(min(t*4,1))ではなく、なだらかなイーズインカーブに変更
+        const double eased = std::min(fade_progress * 2.2, 1.0);
+        const double fade_in = eased * eased * (3.0 - 2.0 * eased); // smoothstep
 
         // カーブをリサンプリング（curve_length != f0_length でも対応）
         const double depth = depth_curve
@@ -1054,8 +1062,13 @@ void apply_vibrato(double* f0, int f0_length, double frame_period_ms,
 
         const double t_global = global_time_offset_sec
                                 + static_cast<double>(j) * frame_sec;
-        const double vib = std::sin(2.0 * M_PI * rate * t_global)
-                           * kVibDepthMax * depth * f0[j] * fade_in;
+
+        // レート・深さそれぞれに0.6〜0.9Hz程度のゆっくりした自然な揺らぎを重畳
+        const double rate_wander  = 1.0 + 0.04 * std::sin(2.0 * M_PI * 0.6 * t_global);
+        const double depth_wander = 1.0 + 0.10 * std::sin(2.0 * M_PI * 0.9 * t_global + 1.3);
+
+        const double vib = std::sin(2.0 * M_PI * (rate * rate_wander) * t_global)
+                           * kVibDepthMax * depth * depth_wander * f0[j] * fade_in;
         f0[j] = std::max(50.0, f0[j] + vib);
     }
 }
@@ -1096,8 +1109,66 @@ void smooth_f0_gaussian(double* f0, int f0_length)
 }
 
 // ============================================================
-// VOSE_Synthesis
+// apply_f0_jitter
+//
+// 人間の声帯は完全に静止したF0を維持できず、常に微小なゆらぎ(ジッター)
+// がある。現状のF0は smooth_f0_gaussian / apply_vibrato を通しても
+// 「ビブラート区間以外は数学的に完璧」なままで、これが機械的な聴感の
+// 一因になっている。低周波(5〜9Hz程度)の帯域制限ゆらぎを±数セント
+// 重畳し、「気づかない程度」の深さに留める(音痴に聞こえない範囲)。
+// ★必ず VOSE_Synthesis (WORLD合成) の"前"に呼ぶこと。
 // ============================================================
+static void apply_f0_jitter(
+    double* f0, int f0_length, double frame_period_ms,
+    double global_time_offset_sec, uint32_t voice_seed)
+{
+    if (!f0 || f0_length <= 0) return;
+
+    // 音源ごとに位相をずらし、複数ノートが完全に同期して揺れる不自然さを避ける
+    const double phase_offset = (voice_seed % 1000) / 1000.0 * 2.0 * M_PI;
+
+    constexpr double kJitterCents   = 4.0;   // ジッター深さ(セント)。控えめに。
+    constexpr double kJitterRateHz  = 5.3;   // 声帯の自然な微振動に近い帯域
+    constexpr double kJitterRateHz2 = 8.7;   // 単一周波数だと機械的なので2波合成
+
+    const double frame_sec = frame_period_ms / 1000.0;
+    for (int j = 0; j < f0_length; ++j) {
+        if (f0[j] <= 0.0) continue;
+        const double t = global_time_offset_sec + j * frame_sec;
+        const double n1 = std::sin(2.0 * M_PI * kJitterRateHz  * t + phase_offset);
+        const double n2 = std::sin(2.0 * M_PI * kJitterRateHz2 * t + phase_offset * 1.7);
+        const double jitter_cents = kJitterCents * 0.5 * (n1 + 0.6 * n2);
+        f0[j] *= std::pow(2.0, jitter_cents / 1200.0);
+    }
+}
+
+// ============================================================
+// apply_shimmer
+//
+// F0ジッターと同じ低周波帯域に軽く連動した振幅ゆらぎ(±0.3dB程度)を
+// 出力波形に重畳する。完全に同期させると不自然なので、ジッターとは
+// わずかに異なる周波数・位相にする。
+// ★必ず VOSE_Synthesis (WORLD合成) の"後"、出力波形に対して呼ぶこと。
+// ============================================================
+static void apply_shimmer(
+    std::vector<double>& note_buf, int fs,
+    double global_time_offset_sec, uint32_t voice_seed)
+{
+    if (note_buf.empty() || fs <= 0) return;
+
+    const double phase_offset = (voice_seed % 1000) / 1000.0 * 2.0 * M_PI;
+    constexpr double kShimmerDb     = 0.3;
+    constexpr double kShimmerRateHz = 4.6;
+    const double sample_sec = 1.0 / fs;
+    for (size_t i = 0; i < note_buf.size(); ++i) {
+        const double t = global_time_offset_sec + static_cast<double>(i) * sample_sec;
+        const double s = std::sin(2.0 * M_PI * kShimmerRateHz * t + phase_offset * 0.5);
+        const double gain_db = kShimmerDb * s;
+        note_buf[i] *= std::pow(10.0, gain_db / 20.0);
+    }
+}
+
+
 
 static void VOSE_Synthesis(
     const double* f0, int f0_length,
@@ -1321,6 +1392,17 @@ void synthesize_note_impl(const SynthNoteParams& p, std::vector<double>& note_bu
     apply_vibrato(tl_scratch.f0.data(), output_frames, kFramePeriod,
                   p.global_time_sec, vib_depth, vib_rate, vib_clen);
 
+    // voice_seed: 音源キー(エイリアス文字列)のハッシュ。ノートごとに
+    // ジッター/シマーの位相をずらし、複数ノートが完全に同期して
+    // 揺れる不自然さを避ける。
+    const uint32_t voice_seed = static_cast<uint32_t>(
+        std::hash<std::string>{}(pp.ev->path));
+
+    // ★F0ジッターは必ず VOSE_Synthesis の前に適用する（後からf0配列を
+    // いじっても、既に合成済みの波形には反映されないため）
+    apply_f0_jitter(tl_scratch.f0.data(), output_frames, kFramePeriod,
+                     p.global_time_sec, voice_seed);
+
     note_buf.assign(static_cast<size_t>(note_samples), 0.0);
     VOSE_Synthesis(tl_scratch.f0.data(), output_frames,
                    tl_scratch.spec_ptrs.data(), tl_scratch.ap_ptrs.data(),
@@ -1329,6 +1411,9 @@ void synthesize_note_impl(const SynthNoteParams& p, std::vector<double>& note_bu
 
     // ポストEQ: WORLD出力の金属的倍音・箱鳴り補正、高域補強
     apply_post_eq(note_buf.data(), static_cast<int>(note_samples));
+
+    // シマー(振幅ゆらぎ)は出力波形に対して適用する
+    apply_shimmer(note_buf, pp.ev->fs, p.global_time_sec, voice_seed);
 }
 
 // ============================================================
@@ -1612,6 +1697,33 @@ static void execute_render_impl(NoteEvent* notes, int note_count, const char* ou
         };
 
         const int worker_count = std::min(max_threads, total_renderable);
+
+        // ★修正: Emscripten(WASM)を -pthread 無しでビルドした場合、
+        // std::thread は実スレッドとしてスケジューリングされない。
+        // その状態で以下のように「別スレッドが completed をインクリメントし、
+        // メインスレッドは while(completed < total) { sleep_for(30ms); } で
+        // 待つ」設計だと、completed が永遠に増えずメインスレッドが無限ループに
+        // 陥る（ブラウザの書き出しが完了しないまま固まる）。
+        // __EMSCRIPTEN_PTHREADS__ は -pthread 有効時にのみ定義されるマクロなので、
+        // これが無い場合（＝Emscriptenのシングルスレッドビルド）は
+        // ワーカープールを使わずメインスレッドで逐次実行する。
+        // ネイティブビルド、および -pthread 有効なEmscriptenビルドでは
+        // 従来通りマルチスレッドで動作する。
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+        for (int i = 0; i < worker_count; ++i) {
+            worker_fn();
+            if (worker_failed.load(std::memory_order_relaxed)) break;
+            if (is_cancelled()) {
+                cancel_flag.store(true, std::memory_order_relaxed);
+                cancelled_during_synth = true;
+                break;
+            }
+            const int done = completed.load(std::memory_order_relaxed);
+            const int pct  = 2 + static_cast<int>(
+                (static_cast<double>(done) / total_renderable) * 78.0);
+            report_progress(std::min(pct, 80));
+        }
+#else
         std::vector<std::thread> workers;
         workers.reserve(worker_count);
         for (int i = 0; i < worker_count; ++i)
@@ -1638,6 +1750,7 @@ static void execute_render_impl(NoteEvent* notes, int note_count, const char* ou
         }
 
         for (auto& t : workers) t.join();
+#endif
 
         if (worker_failed.load(std::memory_order_relaxed)) {
             failed_during_synth = true;
