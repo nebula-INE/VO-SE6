@@ -1,31 +1,32 @@
 name: Build WebAssembly Engine
-
 on:
   push:
     branches: [ "main", "master" ]
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
-
 jobs:
   build-wasm:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Setup Emscripten
         uses: mymindstorm/setup-emsdk@v14
         with:
           version: latest
-
       - name: Build WebAssembly Module
         run: |
           mkdir -p build/wasm
           cp include/world/*.h src/world/
           # Compile WORLD vocoder and vose_core with Emscripten
-          # Use em++ for C++ linking and add -sDEFAULT_TO_CXX to resolve C++ runtime symbols
+          # ★変更点1: -s MODULARIZE=1 -s EXPORT_NAME='createVoseCoreModule' を追加。
+          #   これが無いとブラウザのグローバルスコープに直接 Module を生やす形式になり、
+          #   Vite等のバンドラからESモジュールとして安全にimportできない。
+          # ★変更点2: -s EXPORTED_RUNTIME_METHODS に FS を追加。
+          #   execute_render() が仮想ファイルシステムへ書き出す output.wav を
+          #   JS側から Module.FS.readFile() で読み出すために必要。
+          # ★変更点3: -s ENVIRONMENT=web で不要なNode.js向けコードを除外し軽量化。
           em++ src/vose_core.cpp \
                src/world/audioio.cpp \
                src/world/cheaptrick.cpp \
@@ -41,10 +42,34 @@ jobs:
                -O3 \
                -s WASM=1 \
                -s ALLOW_MEMORY_GROWTH=1 \
+               -s MODULARIZE=1 \
+               -s EXPORT_NAME="createVoseCoreModule" \
+               -s ENVIRONMENT=web \
                -s EXPORTED_FUNCTIONS="['_load_embedded_resource', '_execute_render', '_set_vocal_timeline', '_get_engine_version', '_clear_engine_cache', '_malloc', '_free']" \
-               -s EXPORTED_RUNTIME_METHODS="['ccall', 'cwrap', 'getValue', 'setValue']" \
+               -s EXPORTED_RUNTIME_METHODS="['ccall', 'cwrap', 'getValue', 'setValue', 'FS', 'stringToUTF8', 'lengthBytesUTF8']" \
                -s DEFAULT_TO_CXX \
                -o build/wasm/vose_core.js
+
+      # ★新規追加: ビルド成果物をActionsのArtifactタブに置くだけでは
+      # アプリからは絶対に参照されない（誰もダウンロード→手動配置しない限り
+      # 永遠に古いビルドのままになる）。ここでリポジトリ内の実際にアプリが
+      # 参照するパス(public/wasm/)へ直接コピー＆コミットして、
+      # 「ビルドしたのに反映されない」を今後起こさないようにする。
+      - name: Deploy build output into repository
+        run: |
+          mkdir -p public/wasm
+          cp build/wasm/vose_core.js public/wasm/vose_core.js
+          cp build/wasm/vose_core.wasm public/wasm/vose_core.wasm
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add public/wasm/vose_core.js public/wasm/vose_core.wasm
+          if git diff --cached --quiet; then
+            echo "No changes to commit (build output identical to previous commit)."
+          else
+            git commit -m "chore: update vose_core.wasm build [skip ci]"
+            git push
+          fi
 
       - name: Upload WebAssembly Artifacts
         uses: actions/upload-artifact@v4
