@@ -7,6 +7,12 @@
 // ここでWASMモジュールの実行そのものをWeb Workerへ移し、メインスレッドは
 // 応答性を保ったまま結果を待てるようにする。
 //
+// ★重要: このWorkerは type:'module' で生成される前提。モジュールWorker内では
+// importScripts() が使えない(仕様上非対応・例外になる)ため、vose_core.js は
+// 動的 import() で読み込む。そのためビルド側も -s EXPORT_ES6=1 で
+// 正式なESモジュール(`export default createVoseCoreModule`)として
+// 出力する必要がある(build_wasm.yml参照)。
+//
 // 注意: Web WorkerにはDOM(document)もWeb Audio APIも無いため、
 // サンプルのfetch/decode/リサンプリングは引き続きメインスレッド(wasmEngine.ts)
 // 側で行い、ここには「登録キー＋16bit PCM」と「NoteEvent構築に必要な
@@ -20,6 +26,8 @@ interface VoseCoreModule {
   lengthBytesUTF8: (str: string) => number;
   _malloc: (size: number) => number;
   _free: (ptr: number) => void;
+  addFunction: (fn: (...args: number[]) => number | void, signature: string) => number;
+  removeFunction: (ptr: number) => void;
   HEAPU8: Uint8Array;
   HEAPF64: Float64Array;
   FS: {
@@ -29,8 +37,6 @@ interface VoseCoreModule {
 }
 
 declare const self: DedicatedWorkerGlobalScope;
-declare function importScripts(...urls: string[]): void;
-declare const createVoseCoreModule: (opts?: Record<string, unknown>) => Promise<VoseCoreModule>;
 
 // NoteEvent構造体レイアウト (wasmEngine.tsと同一。vose_core.hのwasm32版オフセット)
 const NOTE_EVENT_SIZE = 44;
@@ -51,8 +57,13 @@ let modPromise: Promise<VoseCoreModule> | null = null;
 async function getModule(): Promise<VoseCoreModule> {
   if (modPromise) return modPromise;
   modPromise = (async () => {
-    // WorkerにはDOMが無いので importScripts() でロードする
-    importScripts('/wasm/vose_core.js');
+    // vose_core.js はビルド時に生成される実行時アセットであり、TypeScriptの
+    // 型解決対象には含まれない(存在しないモジュールとして型エラーになる)ため
+    // 明示的に無視する。実行時には -s EXPORT_ES6=1 でビルドされた正式な
+    // ESモジュールとして解決される。
+    // @ts-ignore
+    const mod = await import(/* @vite-ignore */ '/wasm/vose_core.js');
+    const createVoseCoreModule = mod.default as (opts?: Record<string, unknown>) => Promise<VoseCoreModule>;
     return createVoseCoreModule({
       locateFile: (path: string) => (path.endsWith('.wasm') ? '/wasm/vose_core.wasm' : path)
     });
@@ -80,7 +91,7 @@ export interface WorkerSampleEntry {
 }
 
 export interface WorkerNoteEntry {
-  key: string;         // load_embedded_resourceに登録したキーと同一
+  key: string; // load_embedded_resourceに登録したキーと同一
   pitchCurveHz: number[];
 }
 
@@ -102,6 +113,9 @@ self.onmessage = async (ev: MessageEvent<RenderRequestMsg>) => {
   if (!msg || msg.type !== 'render') return;
   const { requestId, samples, notes, modeFlag } = msg;
 
+  let progressFnPtr = 0;
+  const allocatedPtrs: number[] = [];
+
   try {
     const mod = await getModule();
 
@@ -115,7 +129,6 @@ self.onmessage = async (ev: MessageEvent<RenderRequestMsg>) => {
     }
 
     // 2. NoteEvent配列を構築する
-    const allocatedPtrs: number[] = [];
     const notesPtr = mod._malloc(notes.length * NOTE_EVENT_SIZE);
     allocatedPtrs.push(notesPtr);
 
@@ -141,27 +154,39 @@ self.onmessage = async (ev: MessageEvent<RenderRequestMsg>) => {
       mod.setValue(base + OFF_PORTAMENTO_LENGTH, 0, 'i32');
     }
 
-    // 3. レンダリング実行(Worker内なのでここが多少時間かかってもメインスレッド/UIはフリーズしない)
+    // 3. レンダリング実行 (execute_render_cancelable で進捗をメインスレッドへ
+    //    中継する。ProgressCallback = void(*)(int) をJS関数から生成する)
     const outputPath = '/vose_output.wav';
+    progressFnPtr = mod.addFunction((percent: number) => {
+      const resp: RenderResponseMsg = { type: 'progress', requestId, percent };
+      (self as unknown as Worker).postMessage(resp);
+    }, 'vi');
+
     mod.ccall(
-      'execute_render',
+      'execute_render_cancelable',
       null,
-      ['number', 'number', 'string', 'number'],
-      [notesPtr, notes.length, outputPath, modeFlag]
+      ['number', 'number', 'string', 'number', 'number', 'number'],
+      [notesPtr, notes.length, outputPath, modeFlag, progressFnPtr, 0] // cancel_cb=0(nullptr)=キャンセル無し
     );
 
     const wavBytes = mod.FS.readFile(outputPath, { encoding: 'binary' }) as Uint8Array;
     const wavCopy = new Uint8Array(wavBytes); // WASMヒープ外へコピー
     try { mod.FS.unlink?.(outputPath); } catch (e) { /* ignore */ }
 
-    for (const ptr of allocatedPtrs) {
-      try { mod._free(ptr); } catch (e) { /* ignore */ }
-    }
-
     const resp: RenderResponseMsg = { type: 'done', requestId, wav: wavCopy.buffer };
     (self as unknown as Worker).postMessage(resp, [wavCopy.buffer]);
   } catch (err: any) {
     const resp: RenderResponseMsg = { type: 'error', requestId, message: err?.message || String(err) };
     (self as unknown as Worker).postMessage(resp);
+  } finally {
+    if (progressFnPtr) {
+      try {
+        const mod = await getModule();
+        mod.removeFunction(progressFnPtr);
+        for (const ptr of allocatedPtrs) {
+          try { mod._free(ptr); } catch (e) { /* ignore */ }
+        }
+      } catch (e) { /* ignore */ }
+    }
   }
 };
