@@ -35,6 +35,15 @@ jobs:
           #   execute_render() が仮想ファイルシステムへ書き出す output.wav を
           #   JS側から Module.FS.readFile() で読み出すために必要。
           # ★変更点3: -s ENVIRONMENT=web で不要なNode.js向けコードを除外し軽量化。
+          # ★変更点4: -s EXPORT_ES6=1 を追加。
+          #   voseCoreWorker.ts は type:'module' のWeb Worker内で動くが、
+          #   モジュールWorker内では importScripts() が使えない(仕様上非対応で
+          #   例外になる)。EXPORT_ES6=1 で vose_core.js 自体を
+          #   `export default createVoseCoreModule` を持つ正式なESモジュールに
+          #   ビルドし、Worker側は動的 import() で読み込む形に統一する。
+          # ★変更点5: addFunction / removeFunction をランタイムメソッドに追加し、
+          #   -s ALLOW_TABLE_GROWTH=1 を付与。execute_render_cancelable() の
+          #   進捗コールバック(JS関数)をC関数ポインタとして渡せるようにするため。
           em++ src/vose_core.cpp \
                src/world/audioio.cpp \
                src/world/cheaptrick.cpp \
@@ -50,11 +59,13 @@ jobs:
                -O3 \
                -s WASM=1 \
                -s ALLOW_MEMORY_GROWTH=1 \
+               -s ALLOW_TABLE_GROWTH=1 \
                -s MODULARIZE=1 \
                -s EXPORT_NAME="createVoseCoreModule" \
-               -s ENVIRONMENT=web \
-               -s EXPORTED_FUNCTIONS="['_load_embedded_resource', '_execute_render', '_set_vocal_timeline', '_get_engine_version', '_clear_engine_cache', '_malloc', '_free']" \
-               -s EXPORTED_RUNTIME_METHODS="['ccall', 'cwrap', 'getValue', 'setValue', 'FS', 'stringToUTF8', 'lengthBytesUTF8']" \
+               -s EXPORT_ES6=1 \
+               -s ENVIRONMENT=web,worker \
+               -s EXPORTED_FUNCTIONS="['_load_embedded_resource', '_execute_render', '_execute_render_cancelable', '_set_vocal_timeline', '_get_engine_version', '_clear_engine_cache', '_malloc', '_free']" \
+               -s EXPORTED_RUNTIME_METHODS="['ccall', 'cwrap', 'getValue', 'setValue', 'FS', 'stringToUTF8', 'lengthBytesUTF8', 'addFunction', 'removeFunction']" \
                -s DEFAULT_TO_CXX \
                -o build/wasm/vose_core.js
 
