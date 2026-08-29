@@ -1247,7 +1247,7 @@ static const double kPostEQ[6][5] = {
     {  1.0679214447,  0.4618551642,  0.1643779455,  0.5229532628,  0.1712012916 }, // 14kHz +1.5dB high shelf
 };
 
-static void apply_post_eq(double* y, int y_length)
+static void apply_post_eq(double* y, int y_length, double high_shelf_scale = 1.0)
 {
     if (!y || y_length <= 0) return;
 
@@ -1256,20 +1256,41 @@ static void apply_post_eq(double* y, int y_length)
     struct BiquadState { double s1 = 0.0, s2 = 0.0; };
     BiquadState states[6];
 
+    // ★修正: 高域シェルフ(9kHz/14kHz、バンド4-5)は常に固定量ブーストしていたが、
+    // apply_gender_shift のフォルマント補正で既に高域方向へスペクトルが
+    // 引き伸ばされている高音ノートにこれをそのまま重ねると、
+    // 「フォルマント補正の明るさ」+「固定EQのブースト」が二重に効いて
+    // キンキンした/変質した音になりやすい。high_shelf_scale
+    // (0.0〜1.0、フォルマント補正が強いノートほど小さくする)で
+    // 高域シェルフ2バンドだけをdry(未処理)とweb(全ブースト)の間でブレンドする。
+    const bool need_high_shelf_blend = high_shelf_scale < 0.999;
+
     for (int i = 0; i < y_length; ++i) {
         double x = y[i];
-        for (int b = 0; b < 6; ++b) {
+        const double dry_before_shelf_input = x;
+        double post_low_bands = x; // バンド0-3(low shelf + 2 peaking + presence)適用後の値
+
+        for (int b = 0; b < 4; ++b) {
             const double* c = kPostEQ[b];
-            // Direct Form II Transposed:
-            //   y[n] = b0*x[n] + s1[n-1]
-            //   s1[n] = b1*x[n] - a1*y[n] + s2[n-1]
-            //   s2[n] = b2*x[n] - a2*y[n]
-            const double out = c[0]*x + states[b].s1;
-            states[b].s1     = c[1]*x - c[3]*out + states[b].s2;
-            states[b].s2     = c[2]*x - c[4]*out;
-            x = out;
+            const double out = c[0]*post_low_bands + states[b].s1;
+            states[b].s1     = c[1]*post_low_bands - c[3]*out + states[b].s2;
+            states[b].s2     = c[2]*post_low_bands - c[4]*out;
+            post_low_bands = out;
         }
-        y[i] = x;
+
+        double with_shelf = post_low_bands;
+        for (int b = 4; b < 6; ++b) {
+            const double* c = kPostEQ[b];
+            const double out = c[0]*with_shelf + states[b].s1;
+            states[b].s1     = c[1]*with_shelf - c[3]*out + states[b].s2;
+            states[b].s2     = c[2]*with_shelf - c[4]*out;
+            with_shelf = out;
+        }
+
+        y[i] = need_high_shelf_blend
+            ? post_low_bands + high_shelf_scale * (with_shelf - post_low_bands)
+            : with_shelf;
+        (void)dry_before_shelf_input;
     }
 }
 
@@ -1322,6 +1343,10 @@ void synthesize_note_impl(const SynthNoteParams& p, std::vector<double>& note_bu
     tl_scratch.ensure_f0(output_frames);
     tl_scratch.ensure_spec(output_frames, spec_bins);
 
+    // apply_post_eq の高域シェルフ減衰量を決めるための、ノート全体の
+    // 代表的なフォルマント補正量(f0_ratio平均)を集計する
+    double f0_ratio_sum = 0.0;
+
     // ----------------------------------------------------------------
     // ステップ1: cur スペクトルを DSP 込みで書き込む
     // (blend_transition_spectra より先に実行する必要がある)
@@ -1362,6 +1387,7 @@ void synthesize_note_impl(const SynthNoteParams& p, std::vector<double>& note_bu
 
         // ---- 4. フォルマント追従（ポルタメント適用後のF0を使用） ----
         const double f0_ratio = (base_f0 > 0.0) ? tl_scratch.f0[j] / base_f0 : 1.0;
+        f0_ratio_sum += f0_ratio;
         apply_gender_shift(sr, spec_bins, gender, tl_scratch.spec_tmp.data(), f0_ratio);
         apply_tension_breath(sr, ar, spec_bins, tension, breath);
     }
@@ -1410,7 +1436,22 @@ void synthesize_note_impl(const SynthNoteParams& p, std::vector<double>& note_bu
                    static_cast<int>(note_samples), note_buf.data());
 
     // ポストEQ: WORLD出力の金属的倍音・箱鳴り補正、高域補強
-    apply_post_eq(note_buf.data(), static_cast<int>(note_samples));
+    //
+    // ★修正: 高域シェルフ(9kHz/14kHz、合計+4dB)は音程に関わらず常に固定量
+    // ブーストしていた。apply_gender_shift のフォルマント補正は音程が
+    // 上がるほどスペクトル包絡を高域方向に引き伸ばすため、既に明るくなった
+    // 高音ノートにこの固定ブーストをそのまま重ねると「フォルマント補正の
+    // 明るさ」+「固定EQのブースト」が二重に効き、キンキンした/変質した
+    // 音になりやすかった。ノート平均のf0_ratio(1.0=基準ピッチ、
+    // 2.0=1オクターブ上)が1オクターブを超えて上がるほど、高域シェルフを
+    // 弱める(最大で通常の40%まで)。1オクターブ以内なら従来通り全開。
+    const double avg_f0_ratio = output_frames > 0 ? (f0_ratio_sum / output_frames) : 1.0;
+    double high_shelf_scale = 1.0;
+    if (avg_f0_ratio > 2.0) {
+        const double octaves_over = std::log2(avg_f0_ratio / 2.0);
+        high_shelf_scale = std::max(0.4, 1.0 - octaves_over * 0.3);
+    }
+    apply_post_eq(note_buf.data(), static_cast<int>(note_samples), high_shelf_scale);
 
     // シマー(振幅ゆらぎ)は出力波形に対して適用する
     apply_shimmer(note_buf, pp.ev->fs, p.global_time_sec, voice_seed);
