@@ -498,7 +498,13 @@ export default function App() {
     });
     
     try {
-      const audioUrl = await renderWasm(currentTrack.notes, tempo, targetVb);
+      const audioUrl = await renderWasm(currentTrack.notes, tempo, targetVb, (pct: number) => {
+        setToast({
+          type: 'info',
+          title: `WASM合成中... ${pct}%`,
+          desc: 'VO-SE Core WebAssemblyエンジンでWAVを合成しています...'
+        });
+      });
       
       if (audioUrl) {
         setToast({
@@ -1756,7 +1762,17 @@ export default function App() {
       desc: 'ノートと音源サンプルをバッチ処理し、音声をレンダリングしています...'
     });
     try {
-      const url = await renderWasm(notes, tempo, targetVb);
+      // ★修正: onProgress が渡されていなかったため、Worker側は進捗を
+      // 送っていても画面には一切反映されず「WAV書き出し中...」のまま
+      // 変化しないように見えていた（本当に停止しているのか、単に重い処理が
+      // 進行中なのか区別できない状態だった）。ここで進捗をトーストへ反映する。
+      const url = await renderWasm(notes, tempo, targetVb, (pct: number) => {
+        setToast({
+          type: 'info',
+          title: `WAV書き出し中... ${pct}%`,
+          desc: 'ノートと音源サンプルをバッチ処理し、音声をレンダリングしています...'
+        });
+      });
       if (url) {
         const a = document.createElement('a');
         a.href = url;
