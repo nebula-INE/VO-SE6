@@ -36,7 +36,12 @@ interface VoseCoreModule {
   };
 }
 
+// @ts-ignore
 declare const self: DedicatedWorkerGlobalScope;
+
+self.onerror = (e) => {
+  console.error('[Worker Error]', e.message, e.filename, e.lineno);
+};
 
 // NoteEvent構造体レイアウト (wasmEngine.tsと同一。vose_core.hのwasm32版オフセット)
 const NOTE_EVENT_SIZE = 44;
@@ -57,14 +62,10 @@ let modPromise: Promise<VoseCoreModule> | null = null;
 async function getModule(): Promise<VoseCoreModule> {
   if (modPromise) return modPromise;
   modPromise = (async () => {
-    // vose_core.js はビルド時に生成される実行時アセットであり、TypeScriptの
-    // 型解決対象には含まれない(存在しないモジュールとして型エラーになる)ため
-    // 明示的に無視する。実行時には -s EXPORT_ES6=1 でビルドされた正式な
-    // ESモジュールとして解決される。
-    // @ts-ignore
-    const mod = await import(/* @vite-ignore */ '/wasm/vose_core.js');
-    const createVoseCoreModule = mod.default as (opts?: Record<string, unknown>) => Promise<VoseCoreModule>;
-    return createVoseCoreModule({
+    const wasmJsUrl = new URL('/wasm/vose_core.js', self.location.origin).href;
+    const mod = await import(/* @vite-ignore */ wasmJsUrl);
+    const createVoseCoreModule = mod.default || mod;
+    return await (createVoseCoreModule as any)({
       locateFile: (path: string) => (path.endsWith('.wasm') ? '/wasm/vose_core.wasm' : path)
     });
   })();
@@ -109,6 +110,7 @@ export type RenderResponseMsg =
   | { type: 'error'; requestId: number; message: string };
 
 self.onmessage = async (ev: MessageEvent<RenderRequestMsg>) => {
+  console.log("[Worker] received message:", ev.data.type);
   const msg = ev.data;
   if (!msg || msg.type !== 'render') return;
   const { requestId, samples, notes, modeFlag } = msg;
@@ -117,7 +119,9 @@ self.onmessage = async (ev: MessageEvent<RenderRequestMsg>) => {
   const allocatedPtrs: number[] = [];
 
   try {
+    console.log("[Worker] waiting for getModule()...");
     const mod = await getModule();
+    console.log("[Worker] getModule() resolved");
 
     // 1. サンプルをWASM側へ登録する
     for (const s of samples) {
@@ -176,12 +180,15 @@ self.onmessage = async (ev: MessageEvent<RenderRequestMsg>) => {
     const resp: RenderResponseMsg = { type: 'done', requestId, wav: wavCopy.buffer };
     (self as unknown as Worker).postMessage(resp, [wavCopy.buffer]);
   } catch (err: any) {
+    console.error("[Worker] Error caught:", err);
     const resp: RenderResponseMsg = { type: 'error', requestId, message: err?.message || String(err) };
     (self as unknown as Worker).postMessage(resp);
   } finally {
     if (progressFnPtr) {
       try {
-        const mod = await getModule();
+        console.log("[Worker] waiting for getModule()...");
+    const mod = await getModule();
+    console.log("[Worker] getModule() resolved");
         mod.removeFunction(progressFnPtr);
         for (const ptr of allocatedPtrs) {
           try { mod._free(ptr); } catch (e) { /* ignore */ }

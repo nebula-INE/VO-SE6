@@ -453,6 +453,27 @@ export default function App() {
   const [testResult, setTestResult] = useState<{ stdout: string; stderr: string; success: boolean } | null>(null);
   const [isRunningTests, setIsRunningTests] = useState<boolean>(false);
   const [isRenderingWav, setIsRenderingWav] = useState<boolean>(false);
+  const [renderProgress, setRenderProgress] = useState<{
+    pct: number;
+    remainingSec: number | null;
+    elapsedSec: number;
+  } | null>(null);
+
+  // 残り時間のフォーマット表示ヘルパー
+  const formatEta = (seconds: number | null | undefined): string => {
+    if (seconds === null || seconds === undefined || isNaN(seconds)) {
+      return '計算中...';
+    }
+    if (seconds <= 0) {
+      return 'まもなく完了';
+    }
+    if (seconds < 60) {
+      return `約${seconds}秒`;
+    }
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `約${mins}分${secs > 0 ? `${secs}秒` : ''}`;
+  };
 
   // Oto Inspector State
   const [otoOffset, setOtoOffset] = useState<number>(15);
@@ -491,26 +512,44 @@ export default function App() {
     }
 
     setIsRenderingWav(true);
+    const startTime = performance.now();
+    setRenderProgress({ pct: 0, remainingSec: null, elapsedSec: 0 });
     setToast({
       type: 'info',
-      title: 'WASM合成中...',
+      title: 'WASM合成中... 0% (計算中...)',
       desc: 'VO-SE Core WebAssemblyエンジンでWAVを合成しています...'
     });
     
     try {
       const audioUrl = await renderWasm(currentTrack.notes, tempo, targetVb, (pct: number) => {
+        const elapsedSec = (performance.now() - startTime) / 1000;
+        let remainingSec: number | null = null;
+        if (pct > 2 && pct < 100) {
+          remainingSec = Math.max(0, Math.round((elapsedSec / pct) * (100 - pct)));
+        } else if (pct >= 100) {
+          remainingSec = 0;
+        }
+
+        setRenderProgress({
+          pct,
+          remainingSec,
+          elapsedSec: Math.round(elapsedSec)
+        });
+
+        const etaText = pct >= 100 ? 'まもなく完了' : `残り ${formatEta(remainingSec)}`;
         setToast({
           type: 'info',
-          title: `WASM合成中... ${pct}%`,
+          title: `WASM合成中... ${pct}% (${etaText})`,
           desc: 'VO-SE Core WebAssemblyエンジンでWAVを合成しています...'
         });
       });
       
       if (audioUrl) {
+        const totalDurationSec = Math.round((performance.now() - startTime) / 1000);
         setToast({
           type: 'success',
           title: 'レンダリング完了',
-          desc: 'ブラウザ内のWASMエンジンで高品質合成が完了しました。'
+          desc: `ブラウザ内のWASMエンジンで高品質合成が完了しました。(処理時間: ${totalDurationSec}秒)`
         });
         
         const audio = new Audio(audioUrl);
@@ -526,6 +565,7 @@ export default function App() {
       });
     } finally {
       setIsRenderingWav(false);
+      setRenderProgress(null);
     }
   };
 
@@ -1738,15 +1778,30 @@ export default function App() {
   const downloadBlob = (blob: Blob, filename: string) => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
+    a.style.display = 'none';
     a.href = url;
     a.download = filename;
+    document.body.appendChild(a);
     a.click();
+    document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
 
   // Export WAV Audio File (Real Voicebank WAV + High Quality Offline Rendering)
   const handleExportWav = async () => {
-    if (notes.length === 0) {
+    let notesToRender: Note[] = [];
+    if (tracks && tracks.length > 0) {
+      tracks.forEach((t) => {
+        if (!t.isMuted && t.type === 'vocal' && t.notes && t.notes.length > 0) {
+          notesToRender.push(...t.notes);
+        }
+      });
+    }
+    if (notesToRender.length === 0) {
+      notesToRender = notes;
+    }
+
+    if (notesToRender.length === 0) {
       alert('書き出すノートが存在しません。');
       return;
     }
@@ -1756,32 +1811,49 @@ export default function App() {
       return;
     }
     setIsRenderingWav(true);
+    const startTime = performance.now();
+    setRenderProgress({ pct: 0, remainingSec: null, elapsedSec: 0 });
     setToast({
       type: 'info',
-      title: 'WAV書き出し中',
-      desc: 'ノートと音源サンプルをバッチ処理し、音声をレンダリングしています...'
+      title: 'WAV書き出し中... 0% (計算中...)',
+      desc: 'ノートと音源サンプルを処理し、高音質WAV音声を合成しています...'
     });
     try {
-      // ★修正: onProgress が渡されていなかったため、Worker側は進捗を
-      // 送っていても画面には一切反映されず「WAV書き出し中...」のまま
-      // 変化しないように見えていた（本当に停止しているのか、単に重い処理が
-      // 進行中なのか区別できない状態だった）。ここで進捗をトーストへ反映する。
-      const url = await renderWasm(notes, tempo, targetVb, (pct: number) => {
+      const url = await renderWasm(notesToRender, tempo, targetVb, (pct: number) => {
+        const elapsedSec = (performance.now() - startTime) / 1000;
+        let remainingSec: number | null = null;
+        if (pct > 2 && pct < 100) {
+          remainingSec = Math.max(0, Math.round((elapsedSec / pct) * (100 - pct)));
+        } else if (pct >= 100) {
+          remainingSec = 0;
+        }
+
+        setRenderProgress({
+          pct,
+          remainingSec,
+          elapsedSec: Math.round(elapsedSec)
+        });
+
+        const etaText = pct >= 100 ? 'まもなく完了' : `残り ${formatEta(remainingSec)}`;
         setToast({
           type: 'info',
-          title: `WAV書き出し中... ${pct}%`,
-          desc: 'ノートと音源サンプルをバッチ処理し、音声をレンダリングしています...'
+          title: `WAV書き出し中... ${pct}% (${etaText})`,
+          desc: 'ノートと音源サンプルを処理し、高音質WAV音声を合成しています...'
         });
       });
       if (url) {
+        const totalDurationSec = Math.round((performance.now() - startTime) / 1000);
         const a = document.createElement('a');
+        a.style.display = 'none';
         a.href = url;
         a.download = `${projectName.replace(/\s+/g, '_')}_rendered.wav`;
+        document.body.appendChild(a);
         a.click();
+        document.body.removeChild(a);
         setToast({
           type: 'success',
           title: 'WAV書き出し完了',
-          desc: `${projectName}_rendered.wav を書き出しました。`
+          desc: `${projectName}_rendered.wav を書き出しました。(処理時間: ${totalDurationSec}秒)`
         });
       } else {
         throw new Error('音声データの生成に失敗しました。');
@@ -1790,6 +1862,7 @@ export default function App() {
       alert('WAV音声書き出しに失敗しました: ' + err.message);
     } finally {
       setIsRenderingWav(false);
+      setRenderProgress(null);
     }
   };
 
@@ -2548,14 +2621,23 @@ export default function App() {
           <button
             onClick={handleExportWav}
             disabled={isRenderingWav}
-            className="flex items-center space-x-1.5 text-xs bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white font-medium px-3 py-1.5 rounded-md transition shadow-md shadow-cyan-600/20"
+            className="flex items-center space-x-1.5 text-xs bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white font-medium px-3 py-1.5 rounded-md transition shadow-md shadow-cyan-600/20 font-sans"
+            title="WAV音声ファイルをレンダリングしてダウンロードします"
           >
             {isRenderingWav ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
             ) : (
-              <Download className="w-3.5 h-3.5" />
+              <Download className="w-3.5 h-3.5 shrink-0" />
             )}
-            <span>{isRenderingWav ? 'WAV レンダー中...' : 'WAV 音声書き出し'}</span>
+            <span>
+              {isRenderingWav
+                ? `WAV 書き出し中... ${renderProgress?.pct ?? 0}% (${
+                    renderProgress?.remainingSec !== null && renderProgress?.remainingSec !== undefined
+                      ? `残${formatEta(renderProgress.remainingSec)}`
+                      : '計算中'
+                  })`
+                : 'WAV 音声書き出し'}
+            </span>
           </button>
         </div>
       </header>
@@ -4097,6 +4179,29 @@ export default function App() {
                   }`}
                   style={{ width: `${uploadProgress}%` }}
                 />
+              </div>
+            )}
+
+            {/* Graphical Progress Bar for WAV Rendering with ETA */}
+            {isRenderingWav && renderProgress && (
+              <div className="space-y-1.5 pt-1">
+                <div className="flex items-center justify-between text-[11px] font-mono">
+                  <span className="text-cyan-300 font-bold">進捗: {renderProgress.pct}%</span>
+                  <span className="text-emerald-300 font-semibold bg-emerald-950/80 px-2 py-0.5 rounded border border-emerald-800/60">
+                    残り: {formatEta(renderProgress.remainingSec)}
+                  </span>
+                </div>
+                <div className="w-full bg-slate-950 rounded-full h-2 overflow-hidden border border-slate-800 p-0.5">
+                  <div
+                    className="h-full rounded-full transition-all duration-200 bg-gradient-to-r from-cyan-500 via-teal-400 to-emerald-400"
+                    style={{ width: `${Math.max(2, renderProgress.pct)}%` }}
+                  />
+                </div>
+                {renderProgress.elapsedSec > 0 && (
+                  <div className="text-[10px] text-slate-400 text-right font-mono">
+                    経過時間: {renderProgress.elapsedSec}秒
+                  </div>
+                )}
               </div>
             )}
 
