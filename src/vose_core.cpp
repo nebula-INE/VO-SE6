@@ -998,7 +998,19 @@ void blend_transition_spectra(
 {
     if (!spec_cur || !spec_prev || !ap_cur || !ap_prev) return;
     if (spec_bins <= 0 || cur_len <= 0 || prev_len <= 0) return;
-    const int blend = std::min(transition_frames, std::min(cur_len, prev_len));
+
+    // ★修正: 以前は transition_frames(固定60ms=12フレーム)を
+    // min(cur_len, prev_len) でしかクランプしておらず、短いノート
+    // （速いテンポの16分音符など、88ms=17〜18フレーム程度）では
+    // ノート全体の60%以上が前のノートのスペクトル包絡で塗りつぶされて
+    // いた。子音の立ち上がり（摩擦音の高域ノイズ等、その音素を特徴づける
+    // 最も重要な部分）がここで失われ、全く別の音素に聞こえる原因になって
+    // いた（例:「し」が「み」に聞こえる）。
+    // ここでノート自身の長さの35%を上限にも加え、短いノートほど
+    // ブレンド幅自体を狭めることで、ノート本来の音色を守る。
+    const int max_by_note_ratio = std::max(1, static_cast<int>(cur_len * 0.35));
+    const int blend = std::min({transition_frames, cur_len, prev_len, max_by_note_ratio});
+
     for (int j = 0; j < blend; ++j) {
         const double t      = static_cast<double>(j) / blend;
         const double w_prev = 0.5*(1.0-std::cos(M_PI*(1.0-t)));
