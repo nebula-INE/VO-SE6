@@ -39,7 +39,7 @@ interface VoseCoreModule {
 declare const self: DedicatedWorkerGlobalScope;
 
 // NoteEvent構造体レイアウト (wasmEngine.tsと同一。vose_core.hのwasm32版オフセット)
-const NOTE_EVENT_SIZE = 44;
+const NOTE_EVENT_SIZE = 36;
 const OFF_WAV_PATH = 0;
 const OFF_PITCH_CURVE = 4;
 const OFF_PITCH_LENGTH = 8;
@@ -49,23 +49,20 @@ const OFF_BREATH_CURVE = 20;
 const OFF_VIBRATO_DEPTH_CURVE = 24;
 const OFF_VIBRATO_RATE_CURVE = 28;
 const OFF_VIBRATO_CURVE_LENGTH = 32;
-const OFF_PORTAMENTO_OFFSETS = 36;
-const OFF_PORTAMENTO_LENGTH = 40;
 
 let modPromise: Promise<VoseCoreModule> | null = null;
 
 async function getModule(): Promise<VoseCoreModule> {
   if (modPromise) return modPromise;
   modPromise = (async () => {
-    // vose_core.js はビルド時に生成される実行時アセットであり、TypeScriptの
-    // 型解決対象には含まれない(存在しないモジュールとして型エラーになる)ため
-    // 明示的に無視する。実行時には -s EXPORT_ES6=1 でビルドされた正式な
-    // ESモジュールとして解決される。
+    // vose_core.js は public/wasm/ に配置された実行時静的アセット。
+    // Viteの静的インポート解決エラーを回避するため、変数経由のURL指定で動的インポートする。
+    const scriptUrl = `${self.location?.origin || ''}/wasm/vose_core.js`;
     // @ts-ignore
-    const mod = await import(/* @vite-ignore */ '/wasm/vose_core.js');
+    const mod = await import(/* @vite-ignore */ scriptUrl);
     const createVoseCoreModule = mod.default as (opts?: Record<string, unknown>) => Promise<VoseCoreModule>;
     return createVoseCoreModule({
-      locateFile: (path: string) => (path.endsWith('.wasm') ? '/wasm/vose_core.wasm' : path)
+      locateFile: (path: string) => (path.endsWith('.wasm') ? `${self.location?.origin || ''}/wasm/vose_core.wasm` : path)
     });
   })();
   return modPromise;
@@ -74,7 +71,9 @@ async function getModule(): Promise<VoseCoreModule> {
 function allocDoubleArray(mod: VoseCoreModule, values: number[] | null): number {
   if (!values || values.length === 0) return 0;
   const ptr = mod._malloc(values.length * 8);
-  mod.HEAPF64.set(Float64Array.from(values), ptr / 8);
+  for (let i = 0; i < values.length; i++) {
+    mod.setValue(ptr + i * 8, values[i], 'double');
+  }
   return ptr;
 }
 
@@ -125,8 +124,11 @@ self.onmessage = async (ev: MessageEvent<RenderRequestMsg>) => {
     for (const s of samples) {
       const view = new Int16Array(s.pcm16);
       const pcmPtr = mod._malloc(view.length * 2);
-      mod.HEAPU8.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength), pcmPtr);
-      mod.ccall('load_embedded_resource', null, ['string', 'number', 'number'], [s.key, pcmPtr, view.length]);
+      const u8 = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+      for (let i = 0; i < u8.length; i++) {
+        mod.setValue(pcmPtr + i, u8[i], 'i8');
+      }
+      console.log("Loading", s.key); mod.ccall('load_embedded_resource', null, ['string', 'number', 'number'], [s.key, pcmPtr, view.length]);
       mod._free(pcmPtr);
     }
 
@@ -158,23 +160,16 @@ self.onmessage = async (ev: MessageEvent<RenderRequestMsg>) => {
       mod.setValue(base + OFF_VIBRATO_DEPTH_CURVE, 0, 'i32');
       mod.setValue(base + OFF_VIBRATO_RATE_CURVE, 0, 'i32');
       mod.setValue(base + OFF_VIBRATO_CURVE_LENGTH, 0, 'i32');
-      mod.setValue(base + OFF_PORTAMENTO_OFFSETS, 0, 'i32');
-      mod.setValue(base + OFF_PORTAMENTO_LENGTH, 0, 'i32');
     }
 
-    // 3. レンダリング実行 (execute_render_cancelable で進捗をメインスレッドへ
-    //    中継する。ProgressCallback = void(*)(int) をJS関数から生成する)
+    // 3. レンダリング実行
     const outputPath = '/vose_output.wav';
-    progressFnPtr = mod.addFunction((percent: number) => {
-      const resp: RenderResponseMsg = { type: 'progress', requestId, percent };
-      (self as unknown as Worker).postMessage(resp);
-    }, 'vi');
-
+    
     mod.ccall(
-      'execute_render_cancelable',
+      'execute_render',
       null,
-      ['number', 'number', 'string', 'number', 'number', 'number'],
-      [notesPtr, notes.length, outputPath, modeFlag, progressFnPtr, 0] // cancel_cb=0(nullptr)=キャンセル無し
+      ['number', 'number', 'string', 'number'],
+      [notesPtr, notes.length, outputPath, modeFlag]
     );
 
     const wavBytes = mod.FS.readFile(outputPath, { encoding: 'binary' }) as Uint8Array;
@@ -191,10 +186,13 @@ self.onmessage = async (ev: MessageEvent<RenderRequestMsg>) => {
       try {
         const mod = await getModule();
         mod.removeFunction(progressFnPtr);
-        for (const ptr of allocatedPtrs) {
-          try { mod._free(ptr); } catch (e) { /* ignore */ }
-        }
       } catch (e) { /* ignore */ }
     }
+    try {
+      const mod = await getModule();
+      for (const ptr of allocatedPtrs) {
+        try { mod._free(ptr); } catch (e) { /* ignore */ }
+      }
+    } catch (e) { /* ignore */ }
   }
 };

@@ -1859,7 +1859,7 @@ export default function App() {
         throw new Error('音声データの生成に失敗しました。');
       }
     } catch (err: any) {
-      alert('WAV音声書き出しに失敗しました: ' + err.message);
+      console.error(err); alert('WAV音声書き出しに失敗しました: ' + (err.stack || err.message));
     } finally {
       setIsRenderingWav(false);
       setRenderProgress(null);
