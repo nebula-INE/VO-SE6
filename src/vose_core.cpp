@@ -1727,21 +1727,10 @@ static void execute_render_impl(NoteEvent* notes, int note_count, const char* ou
                 if (bi >= total_renderable) return;
 
                 const int idx = renderable_indices[bi];
-                // ★診断用ログ: 「1%表示のまま完全に固まる」問題の原因を
-                // 特定するため、どのノート処理中に止まるかを可視化する。
-                // ブラウザのコンソールに出力される(Emscriptenのstderr転送経由)。
-                // 原因が判明した後は削除して構わない。
-                fprintf(stderr, "[Render] note %d/%d 開始: wav_path='%s' pitch_length=%d\n",
-                        idx, note_count,
-                        notes[idx].wav_path ? notes[idx].wav_path : "(null=休符)",
-                        notes[idx].pitch_length);
-                fflush(stderr);
                 try {
                     SynthNoteParams p{ prepass[idx], notes[idx], fft_size, spec_bins,
                                        note_global_time[idx] };
                     synthesize_note_impl(p, note_bufs[idx]);
-                    fprintf(stderr, "[Render] note %d/%d 完了\n", idx, note_count);
-                    fflush(stderr);
                 } catch (const std::exception& e) {
                     std::lock_guard<std::mutex> elg(worker_error_mutex);
                     if (!worker_failed.exchange(true, std::memory_order_relaxed))
