@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html><body>
+<script type="module">
+  import createVoseCoreModule from '/wasm/vose_core.js';
+  
+  createVoseCoreModule().then(mod => {
+    try {
+      console.log("Module loaded");
+      const key = "test";
+      const pcm16 = new Int16Array(100);
+      const pcmPtr = mod._malloc(pcm16.length * 2);
+      mod.HEAPU8.set(new Uint8Array(pcm16.buffer), pcmPtr);
+      mod.ccall('load_embedded_resource', null, ['string', 'number', 'number'], [key, pcmPtr, pcm16.length]);
+      console.log("load_embedded_resource SUCCESS");
+      mod._free(pcmPtr);
+    } catch(e) {
+      console.error("ERROR IN LOAD:", e);
+    }
+  });
+</script>
+</body></html>
