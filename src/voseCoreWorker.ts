@@ -39,7 +39,13 @@ interface VoseCoreModule {
 declare const self: DedicatedWorkerGlobalScope;
 
 // NoteEvent構造体レイアウト (wasmEngine.tsと同一。vose_core.hのwasm32版オフセット)
-const NOTE_EVENT_SIZE = 36;
+// ★修正: portamento_offsets/portamento_length追加分(8バイト)がここに
+//   反映されておらず、C++側のsizeof(NoteEvent)=44バイトに対して
+//   ここが36バイトのままだった。ノート数が増えるほどJS側で確保した
+//   バッファとC++側が期待するストライドがずれ、確保領域外への
+//   書き込み/読み込みが発生して "Out of bounds memory access" で
+//   WASMがトラップしていた（1音だけなら顕在化しにくい）。
+const NOTE_EVENT_SIZE = 44;
 const OFF_WAV_PATH = 0;
 const OFF_PITCH_CURVE = 4;
 const OFF_PITCH_LENGTH = 8;
@@ -49,6 +55,8 @@ const OFF_BREATH_CURVE = 20;
 const OFF_VIBRATO_DEPTH_CURVE = 24;
 const OFF_VIBRATO_RATE_CURVE = 28;
 const OFF_VIBRATO_CURVE_LENGTH = 32;
+const OFF_PORTAMENTO_OFFSETS = 36;
+const OFF_PORTAMENTO_LENGTH = 40;
 
 let modPromise: Promise<VoseCoreModule> | null = null;
 
@@ -125,10 +133,12 @@ self.onmessage = async (ev: MessageEvent<RenderRequestMsg>) => {
       const view = new Int16Array(s.pcm16);
       const pcmPtr = mod._malloc(view.length * 2);
       const u8 = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-      for (let i = 0; i < u8.length; i++) {
-        mod.setValue(pcmPtr + i, u8[i], 'i8');
-      }
-      console.log("Loading", s.key); mod.ccall('load_embedded_resource', null, ['string', 'number', 'number'], [s.key, pcmPtr, view.length]);
+      // ★修正: 1バイトずつsetValue()していた箇所を一括コピーに変更。
+      //   大きめの音源(数十万バイト級)がいくつも登録されると、以前の
+      //   実装ではJS関数呼び出しが数百万〜数千万回発生し、体感上
+      //   「フリーズしている」ように見えるレベルまで遅くなっていた。
+      mod.HEAPU8.set(u8, pcmPtr);
+      mod.ccall('load_embedded_resource', null, ['string', 'number', 'number'], [s.key, pcmPtr, view.length]);
       mod._free(pcmPtr);
     }
 
@@ -160,6 +170,11 @@ self.onmessage = async (ev: MessageEvent<RenderRequestMsg>) => {
       mod.setValue(base + OFF_VIBRATO_DEPTH_CURVE, 0, 'i32');
       mod.setValue(base + OFF_VIBRATO_RATE_CURVE, 0, 'i32');
       mod.setValue(base + OFF_VIBRATO_CURVE_LENGTH, 0, 'i32');
+      // ★追加: portamento_offsets(ポインタ)/portamento_lengthも構造体の
+      //   一部なので、未使用でも必ず明示的に書いておく(ゴミ値のまま
+      //   execute_render に渡すと不正なポインタとしてデリファレンスされうる)
+      mod.setValue(base + OFF_PORTAMENTO_OFFSETS, 0, 'i32');
+      mod.setValue(base + OFF_PORTAMENTO_LENGTH, 0, 'i32');
     }
 
     // 3. レンダリング実行
