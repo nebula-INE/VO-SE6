@@ -36,15 +36,14 @@ interface VoseCoreModule {
   };
 }
 
+// @ts-ignore
 declare const self: DedicatedWorkerGlobalScope;
 
+self.onerror = (e) => {
+  console.error('[Worker Error]', e.message, e.filename, e.lineno);
+};
+
 // NoteEvent構造体レイアウト (wasmEngine.tsと同一。vose_core.hのwasm32版オフセット)
-// ★修正: portamento_offsets/portamento_length追加分(8バイト)がここに
-//   反映されておらず、C++側のsizeof(NoteEvent)=44バイトに対して
-//   ここが36バイトのままだった。ノート数が増えるほどJS側で確保した
-//   バッファとC++側が期待するストライドがずれ、確保領域外への
-//   書き込み/読み込みが発生して "Out of bounds memory access" で
-//   WASMがトラップしていた（1音だけなら顕在化しにくい）。
 const NOTE_EVENT_SIZE = 44;
 const OFF_WAV_PATH = 0;
 const OFF_PITCH_CURVE = 4;
@@ -63,14 +62,11 @@ let modPromise: Promise<VoseCoreModule> | null = null;
 async function getModule(): Promise<VoseCoreModule> {
   if (modPromise) return modPromise;
   modPromise = (async () => {
-    // vose_core.js は public/wasm/ に配置された実行時静的アセット。
-    // Viteの静的インポート解決エラーを回避するため、変数経由のURL指定で動的インポートする。
-    const scriptUrl = `${self.location?.origin || ''}/wasm/vose_core.js`;
-    // @ts-ignore
-    const mod = await import(/* @vite-ignore */ scriptUrl);
-    const createVoseCoreModule = mod.default as (opts?: Record<string, unknown>) => Promise<VoseCoreModule>;
-    return createVoseCoreModule({
-      locateFile: (path: string) => (path.endsWith('.wasm') ? `${self.location?.origin || ''}/wasm/vose_core.wasm` : path)
+    const wasmJsUrl = new URL('/wasm/vose_core.js', self.location.origin).href;
+    const mod = await import(/* @vite-ignore */ wasmJsUrl);
+    const createVoseCoreModule = mod.default || mod;
+    return await (createVoseCoreModule as any)({
+      locateFile: (path: string) => (path.endsWith('.wasm') ? '/wasm/vose_core.wasm' : path)
     });
   })();
   return modPromise;
@@ -79,9 +75,7 @@ async function getModule(): Promise<VoseCoreModule> {
 function allocDoubleArray(mod: VoseCoreModule, values: number[] | null): number {
   if (!values || values.length === 0) return 0;
   const ptr = mod._malloc(values.length * 8);
-  for (let i = 0; i < values.length; i++) {
-    mod.setValue(ptr + i * 8, values[i], 'double');
-  }
+  mod.HEAPF64.set(Float64Array.from(values), ptr / 8);
   return ptr;
 }
 
@@ -98,10 +92,8 @@ export interface WorkerSampleEntry {
 }
 
 export interface WorkerNoteEntry {
-  key: string;         // load_embedded_resourceに登録したキーと同一(休符なら無視される)
+  key: string; // load_embedded_resourceに登録したキーと同一
   pitchCurveHz: number[];
-  isRest?: boolean;     // true の場合 wav_path=nullptr で登録し、vose_core.cpp側の
-                        // 「休符で前ノート参照をリセットする」既存機構を機能させる
 }
 
 export interface RenderRequestMsg {
@@ -118,6 +110,7 @@ export type RenderResponseMsg =
   | { type: 'error'; requestId: number; message: string };
 
 self.onmessage = async (ev: MessageEvent<RenderRequestMsg>) => {
+  console.log("[Worker] received message:", ev.data.type);
   const msg = ev.data;
   if (!msg || msg.type !== 'render') return;
   const { requestId, samples, notes, modeFlag } = msg;
@@ -126,18 +119,15 @@ self.onmessage = async (ev: MessageEvent<RenderRequestMsg>) => {
   const allocatedPtrs: number[] = [];
 
   try {
+    console.log("[Worker] waiting for getModule()...");
     const mod = await getModule();
+    console.log("[Worker] getModule() resolved");
 
     // 1. サンプルをWASM側へ登録する
     for (const s of samples) {
       const view = new Int16Array(s.pcm16);
       const pcmPtr = mod._malloc(view.length * 2);
-      const u8 = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-      // ★修正: 1バイトずつsetValue()していた箇所を一括コピーに変更。
-      //   大きめの音源(数十万バイト級)がいくつも登録されると、以前の
-      //   実装ではJS関数呼び出しが数百万〜数千万回発生し、体感上
-      //   「フリーズしている」ように見えるレベルまで遅くなっていた。
-      mod.HEAPU8.set(u8, pcmPtr);
+      mod.HEAPU8.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength), pcmPtr);
       mod.ccall('load_embedded_resource', null, ['string', 'number', 'number'], [s.key, pcmPtr, view.length]);
       mod._free(pcmPtr);
     }
@@ -147,19 +137,13 @@ self.onmessage = async (ev: MessageEvent<RenderRequestMsg>) => {
     allocatedPtrs.push(notesPtr);
 
     for (let i = 0; i < notes.length; i++) {
-      const { key, pitchCurveHz, isRest } = notes[i];
+      const { key, pitchCurveHz } = notes[i];
       const base = notesPtr + i * NOTE_EVENT_SIZE;
 
       const pitchCurvePtr = allocDoubleArray(mod, pitchCurveHz);
       if (pitchCurvePtr) allocatedPtrs.push(pitchCurvePtr);
-
-      // ★休符は wav_path=nullptr(0) で登録する。vose_core.cpp側の
-      // `if (!notes[i].wav_path) { ...; prev_renderable=false; last_ev=nullptr; }`
-      // により、休符をまたいだ誤った遷移ブレンドが正しく防止される。
-      // (空文字列だと "" というキーで load_embedded_resource 済みかの
-      //  検索が走ってしまうため、必ずヌルポインタ自体を渡す)
-      const wavPathPtr = isRest ? 0 : allocCString(mod, key);
-      if (wavPathPtr) allocatedPtrs.push(wavPathPtr);
+      const wavPathPtr = allocCString(mod, key);
+      allocatedPtrs.push(wavPathPtr);
 
       mod.setValue(base + OFF_WAV_PATH, wavPathPtr, 'i32');
       mod.setValue(base + OFF_PITCH_CURVE, pitchCurvePtr, 'i32');
@@ -170,21 +154,23 @@ self.onmessage = async (ev: MessageEvent<RenderRequestMsg>) => {
       mod.setValue(base + OFF_VIBRATO_DEPTH_CURVE, 0, 'i32');
       mod.setValue(base + OFF_VIBRATO_RATE_CURVE, 0, 'i32');
       mod.setValue(base + OFF_VIBRATO_CURVE_LENGTH, 0, 'i32');
-      // ★追加: portamento_offsets(ポインタ)/portamento_lengthも構造体の
-      //   一部なので、未使用でも必ず明示的に書いておく(ゴミ値のまま
-      //   execute_render に渡すと不正なポインタとしてデリファレンスされうる)
       mod.setValue(base + OFF_PORTAMENTO_OFFSETS, 0, 'i32');
       mod.setValue(base + OFF_PORTAMENTO_LENGTH, 0, 'i32');
     }
 
-    // 3. レンダリング実行
+    // 3. レンダリング実行 (execute_render_cancelable で進捗をメインスレッドへ
+    //    中継する。ProgressCallback = void(*)(int) をJS関数から生成する)
     const outputPath = '/vose_output.wav';
-    
+    progressFnPtr = mod.addFunction((percent: number) => {
+      const resp: RenderResponseMsg = { type: 'progress', requestId, percent };
+      (self as unknown as Worker).postMessage(resp);
+    }, 'vi');
+
     mod.ccall(
-      'execute_render',
+      'execute_render_cancelable',
       null,
-      ['number', 'number', 'string', 'number'],
-      [notesPtr, notes.length, outputPath, modeFlag]
+      ['number', 'number', 'string', 'number', 'number', 'number'],
+      [notesPtr, notes.length, outputPath, modeFlag, progressFnPtr, 0] // cancel_cb=0(nullptr)=キャンセル無し
     );
 
     const wavBytes = mod.FS.readFile(outputPath, { encoding: 'binary' }) as Uint8Array;
@@ -194,20 +180,20 @@ self.onmessage = async (ev: MessageEvent<RenderRequestMsg>) => {
     const resp: RenderResponseMsg = { type: 'done', requestId, wav: wavCopy.buffer };
     (self as unknown as Worker).postMessage(resp, [wavCopy.buffer]);
   } catch (err: any) {
+    console.error("[Worker] Error caught:", err);
     const resp: RenderResponseMsg = { type: 'error', requestId, message: err?.message || String(err) };
     (self as unknown as Worker).postMessage(resp);
   } finally {
     if (progressFnPtr) {
       try {
-        const mod = await getModule();
+        console.log("[Worker] waiting for getModule()...");
+    const mod = await getModule();
+    console.log("[Worker] getModule() resolved");
         mod.removeFunction(progressFnPtr);
+        for (const ptr of allocatedPtrs) {
+          try { mod._free(ptr); } catch (e) { /* ignore */ }
+        }
       } catch (e) { /* ignore */ }
     }
-    try {
-      const mod = await getModule();
-      for (const ptr of allocatedPtrs) {
-        try { mod._free(ptr); } catch (e) { /* ignore */ }
-      }
-    } catch (e) { /* ignore */ }
   }
 };

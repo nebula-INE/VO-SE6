@@ -696,7 +696,7 @@ build_analysis_cache(const EmbeddedVoice& ev, int fft_size, int spec_bins)
     opt.f0_floor     = 50.0;
     opt.f0_ceil      = 800.0;
 
-    const int wav_len = static_cast<int>(ev.waveform.size());
+    const int wav_len     = static_cast<int>(ev.waveform.size());
     const int harvest_len = GetSamplesForHarvest(ev.fs, wav_len, kFramePeriod);
     cache->f0.resize(harvest_len);
     cache->time.resize(harvest_len);
@@ -738,16 +738,10 @@ build_analysis_cache(const EmbeddedVoice& ev, int fft_size, int spec_bins)
         sp[i] = &cache->flat_spec[static_cast<size_t>(i)*spec_bins];
         ap[i] = &cache->flat_ap  [static_cast<size_t>(i)*spec_bins];
     }
-
-    CheapTrickOption ct_opt;
-    InitializeCheapTrickOption(ev.fs, &ct_opt);
     CheapTrick(ev.waveform.data(), wav_len, ev.fs,
-               cache->time.data(), cache->f0.data(), harvest_len, &ct_opt, sp.data());
-
-    D4COption d4c_opt;
-    InitializeD4COption(&d4c_opt);
+               cache->time.data(), cache->f0.data(), harvest_len, nullptr, sp.data());
     D4C(ev.waveform.data(), wav_len, ev.fs,
-        cache->time.data(), cache->f0.data(), harvest_len, fft_size, &d4c_opt, ap.data());
+        cache->time.data(), cache->f0.data(), harvest_len, fft_size, nullptr, ap.data());
 
     return cache;
 }
@@ -768,9 +762,17 @@ get_or_analyze(std::shared_ptr<const EmbeddedVoice> ev_sp, int fft_size, int spe
         if (cached) return cached;
     }
 
+    // 2. [修正] ここから先（ディスク読み込み〜新規解析〜保存）はキーごとに
+    //    直列化する。以前はここが完全にロックフリーで、同一音源を使う
+    //    複数ノートが並列ワーカーに割り当たると Harvest/CheapTrick/D4C の
+    //    重複実行や、save_cache() の一時ファイル書き込み競合
+    //    （ファイル破損の可能性）が起こり得た。per-keyロックで
+    //    「他キーの処理は並列のまま、同一キーだけ直列化」する。
     auto key_lock = g_analysis_lock_registry.get_lock(key);
     std::lock_guard<std::mutex> lg(*key_lock);
 
+    // ロック取得を待っている間に他スレッドが解析を完了させている
+    // 可能性があるため、ロック取得後にもう一度メモリキャッシュを確認する。
     {
         auto cached = g_analysis_cache.get(key);
         if (cached) return cached;
@@ -1334,7 +1336,6 @@ void synthesize_note_impl(const SynthNoteParams& p, std::vector<double>& note_bu
     const OtoEntry& current_oto = pp.has_oto ? pp.oto : kDefaultOto;
 
     auto cache_cur = get_or_analyze(pp.ev, fft_size, spec_bins);
-    if (!cache_cur) return;
 
     // フォルマント追従用: 音源の基準F0を求める。
     // ★修正: 以前は解析(CheapTrick/Harvest)の有声フレーム単純平均のみを
@@ -1555,9 +1556,7 @@ static void execute_render_impl(NoteEvent* notes, int note_count, const char* ou
     // 最後の wavwrite 前にリサンプリング処理を挟みます。
     int out_fs = kFs; 
 
-    CheapTrickOption ct_opt;
-    InitializeCheapTrickOption(kFs, &ct_opt);
-    const int fft_size  = ct_opt.fft_size;
+    const int fft_size  = GetFFTSizeForCheapTrick(kFs, nullptr);
     const int spec_bins = fft_size / 2 + 1;
 
     // ----------------------------------------------------------------

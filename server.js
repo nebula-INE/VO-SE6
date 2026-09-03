@@ -291,15 +291,8 @@ class VoicebankRegistryEngine {
     })();
     this.pending.set(vbName, indexPromise);
 
-    let parsed;
-    try {
-      parsed = await indexPromise;
-    } finally {
-      // ★修正: 成功・失敗どちらでも必ず消す。
-      //   ここが無いと解析失敗時に壊れたPromiseがpendingに残り続け、
-      //   同じ音源への以降の全リクエストが永久に固まっていた。
-      this.pending.delete(vbName);
-    }
+    const parsed = await indexPromise;
+    this.pending.delete(vbName);
 
     const indexed = {
       mtime: latestMtime,
@@ -1479,28 +1472,28 @@ app.get('/api/py/voicebank-alias-info', async (req, res) => {
 });
 
 app.get('/api/py/voicebank-sample', async (req, res) => {
-  try {
-    const { name, alias, prevLyric, noteNum } = req.query;
-    if (!alias) return res.status(400).json({ success: false, error: 'Missing alias' });
+  const { name, alias, prevLyric, noteNum } = req.query;
+  if (!alias) return res.status(400).json({ success: false, error: 'Missing alias' });
 
-    const resolved = resolveVoicebankPath(name);
-    if (!resolved) {
-      return res.status(404).json({ success: false, error: 'No voicebank found on server' });
-    }
+  const resolved = resolveVoicebankPath(name);
+  if (!resolved) {
+    return res.status(404).json({ success: false, error: 'No voicebank found on server' });
+  }
 
-    const { resolvedName, resolvedPath } = resolved;
-    const indexed = await vbRegistry.getOrIndex(resolvedName, resolvedPath);
-    let entry = findAliasEntry(indexed, alias, prevLyric, noteNum);
-    let wavFile = entry ? entry.wav_path : null;
+  const { resolvedName, resolvedPath } = resolved;
+  const indexed = await vbRegistry.getOrIndex(resolvedName, resolvedPath);
+  let entry = findAliasEntry(indexed, alias, prevLyric, noteNum);
+  let wavFile = entry ? entry.wav_path : null;
 
-    if (wavFile && !fs.existsSync(wavFile) && entry.filename) {
-      wavFile = resolveWavFilePath(path.dirname(wavFile), entry.filename);
-    }
+  if (wavFile && !fs.existsSync(wavFile) && entry.filename) {
+    wavFile = resolveWavFilePath(path.dirname(wavFile), entry.filename);
+  }
 
-    if (!entry || !wavFile || !fs.existsSync(wavFile)) {
-      return res.status(404).json({ success: false, error: `Sample WAV for alias "${alias}" not found` });
-    }
+  if (!entry || !wavFile || !fs.existsSync(wavFile)) {
+    return res.status(404).json({ success: false, error: `Sample WAV for alias "${alias}" not found` });
+  }
 
+  if (entry) {
     const baseMidi = detectWavBaseMidi(wavFile, entry.alias, entry.filename);
     res.setHeader('X-Oto-Left-Blank', String(entry.left_blank || 0));
     res.setHeader('X-Oto-Fixed-Range', String(entry.fixed_range || 0));
@@ -1509,20 +1502,11 @@ app.get('/api/py/voicebank-sample', async (req, res) => {
     res.setHeader('X-Oto-Overlap', String(entry.overlap || 0));
     res.setHeader('X-Alias-Matched', encodeURIComponent(entry.alias || alias));
     res.setHeader('X-Sample-Base-Midi', String(baseMidi));
-
-    res.setHeader('Content-Type', 'audio/wav');
-    const stream = fs.createReadStream(wavFile);
-    stream.pipe(res);
-  } catch (err) {
-    // ★修正: ここでの例外(oto.ini解析失敗など)を握りつぶさず、必ず
-    //   HTTPレスポンスを返す。以前はここで例外が発生すると何も返らず、
-    //   クライアント側のfetch()が永久にpendingのままになっていた
-    //   （WAV書き出しが0%から進まなくなる不具合の直接原因）。
-    console.error('[voicebank-sample] インデックス/読み込み失敗:', err);
-    if (!res.headersSent) {
-      res.status(500).json({ success: false, error: err.message || String(err) });
-    }
   }
+
+  res.setHeader('Content-Type', 'audio/wav');
+  const stream = fs.createReadStream(wavFile);
+  stream.pipe(res);
 });
 
 // Render Song Notes with Voicebank Mapping API (Pure Native)
