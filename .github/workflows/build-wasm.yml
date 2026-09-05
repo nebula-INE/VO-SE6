@@ -44,6 +44,13 @@ jobs:
           # ★変更点5: addFunction / removeFunction をランタイムメソッドに追加し、
           #   -s ALLOW_TABLE_GROWTH=1 を付与。execute_render_cancelable() の
           #   進捗コールバック(JS関数)をC関数ポインタとして渡せるようにするため。
+          # ★変更点6: EXPORTED_FUNCTIONS に '_set_oto_data' を追加。
+          #   vose_core.cpp / vose_core.h には set_oto_data() が実装されており
+          #   デスクトップ版のネイティブDLLローダーもこれをバインドしているが、
+          #   このWASMビルドの EXPORTED_FUNCTIONS からだけ抜けていた。
+          #   これが無いとWeb版はoto.ini由来のタイミング(offset/consonant/
+          #   cutoff/preutterance/overlap)を一切C++側に渡せず、
+          #   常に kDefaultOto (全フィールド0) でレンダリングされてしまう。
           em++ src/vose_core.cpp \
                src/world/audioio.cpp \
                src/world/cheaptrick.cpp \
@@ -64,7 +71,7 @@ jobs:
                -s EXPORT_NAME="createVoseCoreModule" \
                -s EXPORT_ES6=1 \
                -s ENVIRONMENT=web,worker \
-               -s EXPORTED_FUNCTIONS="['_load_embedded_resource', '_execute_render', '_execute_render_cancelable', '_set_vocal_timeline', '_get_engine_version', '_clear_engine_cache', '_malloc', '_free']" \
+               -s EXPORTED_FUNCTIONS="['_load_embedded_resource', '_execute_render', '_execute_render_cancelable', '_set_oto_data', '_set_vocal_timeline', '_get_engine_version', '_clear_engine_cache', '_malloc', '_free']" \
                -s EXPORTED_RUNTIME_METHODS="['ccall', 'cwrap', 'getValue', 'setValue', 'FS', 'stringToUTF8', 'lengthBytesUTF8', 'addFunction', 'removeFunction']" \
                -s DEFAULT_TO_CXX \
                -o build/wasm/vose_core.js
