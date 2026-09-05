@@ -5,8 +5,8 @@
 //
 // 1. 各トラック・各ノートの音源サンプル(oto.ini設定含む)を並行取得
 // 2. OfflineAudioContext (44.1kHz 2ch) 上で完全なUTAU音響パイプラインを構築:
-//    - サンプルベース音高からのピッチシフト (baseRate)
-//    - USTピッチベンドカーブ (PBS/PBW/PBY) & フォルマント追従フィルター
+//    - サンプルベース音高からのピッチシフト (TD-PSOLA、フォルマント保持)
+//    - USTピッチベンドカーブ (PBS/PBW/PBY) はビブラート等の微小補正として反映
 //    - oto.ini タイムマッピング (Offset, Preutterance, Overlap, Fixed, Cutoff)
 //    - 長音用イコールパワークロスフェードループ (クリック音完全防止)
 //    - アタック/リリース マイクロフェードエンベロープ (音素衝突防止)
@@ -14,17 +14,21 @@
 //    - マスタリングEQ & ダイナミクスリミッター
 // 3. 進捗状況(0%〜100%)およびリアルタイムETAをスムーズにメインUIへ通知
 // 4. 高音質 16-bit PCM WAV (RIFF) を生成してBlob URLを出力
+//
+// 注意: このエンジンは C++ コア(vose_core)やBigVGAN/ONNXパイプラインを
+// 一切呼び出していない。純粋にブラウザのWeb Audio APIのみで完結する
+// 簡易実装(oto.iniベースのサンプル再配置)。
 // ============================================================
 
 import {
   parsePitchBend,
   smoothPitchBendPoints,
-  calculateFormantCutoff,
   softClampSemitone,
   scheduleSafePitchRamp,
   type PitchPoint
 } from './utils/pitchCurve';
 import { bufferToWav } from './utils/audioEncoder';
+import { psolaPitchAndTimeShiftBuffer } from './utils/psolaPitchShift';
 
 export interface FetchedSample {
   buffer: AudioBuffer;
@@ -161,6 +165,59 @@ function getLoopCrossfadedBuffer(
   return newBuffer;
 }
 
+// ------------------------------------------------------------
+// 生波形(未ピッチシフト)のセグメントを組み立てる。
+// PSOLAへ渡す「素材」はここで作る: ピッチも速度もまだ元のまま、
+// 必要な長さ(requiredSampleSec)ぶんだけ、ループが必要ならクロス
+// フェード領域を周回させて敷き詰める。
+// ------------------------------------------------------------
+function buildRawSegment(
+  ctx: BaseAudioContext,
+  cached: FetchedSample,
+  startOffsetInWav: number,
+  requiredSampleSec: number,
+  loopRange: { loopStartSec: number; loopEndSec: number } | null
+): AudioBuffer {
+  const src = cached.buffer;
+  const sr = src.sampleRate;
+  const outLen = Math.max(1, Math.round(requiredSampleSec * sr));
+  const outBuffer = ctx.createBuffer(src.numberOfChannels, outLen, sr);
+  const startSample = Math.max(0, Math.floor(startOffsetInWav * sr));
+
+  if (!loopRange) {
+    for (let ch = 0; ch < src.numberOfChannels; ch++) {
+      const s = src.getChannelData(ch);
+      const d = outBuffer.getChannelData(ch);
+      for (let i = 0; i < outLen; i++) {
+        const idx = startSample + i;
+        d[i] = idx < s.length ? s[idx] : 0;
+      }
+    }
+    return outBuffer;
+  }
+
+  // ループが必要な場合: loopEndSecまでは通常再生、それ以降は
+  // [loopStartSec, loopEndSec) のクロスフェード済み区間を周回させる。
+  const xfaded = getLoopCrossfadedBuffer(ctx, cached, loopRange.loopStartSec, loopRange.loopEndSec);
+  const loopStartSample = Math.max(0, Math.floor(loopRange.loopStartSec * sr));
+  const loopEndSample = Math.min(xfaded.length, Math.floor(loopRange.loopEndSec * sr));
+  const loopLenSamples = Math.max(1, loopEndSample - loopStartSample);
+
+  for (let ch = 0; ch < src.numberOfChannels; ch++) {
+    const s = xfaded.getChannelData(ch % xfaded.numberOfChannels);
+    const d = outBuffer.getChannelData(ch);
+    for (let i = 0; i < outLen; i++) {
+      const absIdx = startSample + i;
+      const idx =
+        absIdx < loopEndSample
+          ? absIdx
+          : loopStartSample + ((absIdx - loopEndSample) % loopLenSamples);
+      d[i] = idx < s.length ? s[idx] : 0;
+    }
+  }
+  return outBuffer;
+}
+
 // ============================================================
 // メインのレンダリング関数
 // ============================================================
@@ -282,48 +339,11 @@ export async function renderStudioOffline(
 
     if (cached && cached.buffer) {
       try {
-        const source = offlineCtx.createBufferSource();
-        source.buffer = cached.buffer;
-
         const sampleBase = cached.baseMidi || 60;
         const semitoneShift = softClampSemitone(note.noteNum - sampleBase);
+        // タイミング計算(消費速度)専用。もう再生には使わない。
         const baseRate = Math.min(4.0, Math.max(0.18, Math.pow(2, semitoneShift / 12)));
-
-        let formantFilter: BiquadFilterNode | null = null;
-        if (note.pbs && note.pbw && note.pby) {
-          try {
-            const rawPoints = parsePitchBend(note.pbs, note.pbw, note.pby);
-            const points = smoothPitchBendPoints(rawPoints);
-
-            formantFilter = offlineCtx.createBiquadFilter();
-            formantFilter.type = 'lowpass';
-            formantFilter.Q.setValueAtTime(0.707, Math.max(0, startTimeSec));
-
-            scheduleSafePitchRamp(
-              source.playbackRate,
-              baseRate,
-              points,
-              startTimeSec,
-              (st) => Math.max(0.18, Math.min(4.0, baseRate * Math.pow(2, st / 12))),
-              0,
-              startTimeSec + durationSec
-            );
-
-            scheduleSafePitchRamp(
-              formantFilter.frequency,
-              calculateFormantCutoff(sampleBase, 0),
-              points,
-              startTimeSec,
-              (st) => calculateFormantCutoff(sampleBase, st),
-              0,
-              startTimeSec + durationSec
-            );
-          } catch (e) {
-            source.playbackRate.setValueAtTime(baseRate, Math.max(0, startTimeSec));
-          }
-        } else {
-          source.playbackRate.setValueAtTime(baseRate, Math.max(0, startTimeSec));
-        }
+        const pitchRatio = Math.pow(2, semitoneShift / 12); // PSOLAはクランプ不要(エイリアシングしない)
 
         const offsetSec = Math.max(0, (cached.left_blank || 0) / 1000);
         const preuttSec = Math.max(0, (cached.preutterance || 0) / 1000);
@@ -346,18 +366,57 @@ export async function renderStudioOffline(
         const playLen = effectivePreuttSec + durationSec;
 
         const requiredSampleSec = (startOffsetInWav - offsetSec) + playLen * baseRate;
+
+        let loopRange: { loopStartSec: number; loopEndSec: number } | null = null;
         if (requiredSampleSec > maxSampleDur + 0.02) {
           const loopStartSec = Math.min(cutoffEndSec - 0.06, offsetSec + Math.max(0.02, fixedSec || preuttSec || 0.05));
           const loopEndSec = Math.min(wavDuration - 0.01, Math.max(loopStartSec + 0.04, cutoffEndSec - 0.01));
           if (loopEndSec > loopStartSec + 0.03) {
-            source.loop = true;
-            source.loopStart = loopStartSec;
-            source.loopEnd = loopEndSec;
-            try {
-              source.buffer = getLoopCrossfadedBuffer(offlineCtx, cached, loopStartSec, loopEndSec);
-            } catch (e) {
-              // fallback to original buffer
-            }
+            loopRange = { loopStartSec, loopEndSec };
+          }
+        }
+
+        // --- ここからがPSOLAによるピッチ+時間シフト ---
+        // 1. 生波形(未シフト)から、必要な区間をループも含めて敷き詰めて切り出す
+        const rawSegment = buildRawSegment(
+          offlineCtx,
+          cached,
+          Math.max(0, Math.min(wavDuration - 0.02, startOffsetInWav)),
+          Math.max(0.02, requiredSampleSec),
+          loopRange
+        );
+
+        // 2. ピッチと時間伸縮を同時に、フォルマントを保持したまま適用
+        const targetLenSamples = Math.max(1, Math.round(playLen * sampleRate));
+        const shiftedBuffer = psolaPitchAndTimeShiftBuffer(
+          offlineCtx,
+          rawSegment,
+          pitchRatio,
+          targetLenSamples
+        );
+
+        const source = offlineCtx.createBufferSource();
+        source.buffer = shiftedBuffer;
+        // ベースピッチはPSOLAで焼き込み済みなので、playbackRateは1.0が基準。
+        source.playbackRate.setValueAtTime(1.0, Math.max(0, actualStartTime));
+
+        // ピッチベンド(ビブラート等)は小さな相対揺れとしてplaybackRateに乗せる。
+        // 揺れ幅は通常小さいのでフォルマントへの影響は知覚できるレベルにならない。
+        if (note.pbs && note.pbw && note.pby) {
+          try {
+            const rawPoints = parsePitchBend(note.pbs, note.pbw, note.pby);
+            const points = smoothPitchBendPoints(rawPoints);
+            scheduleSafePitchRamp(
+              source.playbackRate,
+              1.0,
+              points,
+              startTimeSec,
+              (st) => Math.max(0.5, Math.min(2.0, Math.pow(2, st / 12))),
+              0,
+              startTimeSec + durationSec
+            );
+          } catch (e) {
+            // ピッチベンド解析に失敗しても基準ピッチ(1.0)のまま続行
           }
         }
 
@@ -387,17 +446,11 @@ export async function renderStudioOffline(
         hpf.Q.setValueAtTime(0.707, tStart);
 
         source.connect(hpf);
-        if (formantFilter) {
-          hpf.connect(formantFilter);
-          formantFilter.connect(gain);
-        } else {
-          hpf.connect(gain);
-        }
-
+        hpf.connect(gain);
         gain.connect(masterGain);
 
-        const safeStartOffset = Math.max(0, Math.min(wavDuration - 0.02, startOffsetInWav));
-        source.start(actualStartTime, safeStartOffset);
+        // shiftedBufferは既に必要な長さぶんだけ用意されているのでオフセット不要
+        source.start(actualStartTime, 0);
         source.stop(tEnd + 0.01);
       } catch (err) {
         console.warn('[wasmEngine] Note scheduling failed, fallback to synth:', err);
@@ -452,10 +505,10 @@ export async function renderStudioOffline(
   onProgress?.(40);
 
   // 6. オフラインレンダリング実行 (進捗: 40% -> 90%)
-  // 進捗アニメーション用のタイマー
+  // PSOLA処理が加わった分、単純resampleより重いのでETA見積もりを底上げ
   let progressInterval: number | null = null;
   let currentRenderPct = 40;
-  const estimatedRenderTimeMs = Math.min(8000, Math.max(400, totalDurationSec * 120));
+  const estimatedRenderTimeMs = Math.min(15000, Math.max(600, totalDurationSec * 220));
   const startTime = performance.now();
 
   progressInterval = window.setInterval(() => {
